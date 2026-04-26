@@ -41,6 +41,9 @@ When this heavily degraded, quantized vector is later retrieved from the cache a
 
 To compress these models effectively, we cannot simply stretch the buckets to fit the data; we must find a way to reshape the data to fit the buckets.
 
+> 🔬 **Go deeper:** [Activation Outliers — the full mathematics](theory_outliers.md)
+
+
 ## 3. The Principle of Incoherence (Random Rotation)
 
 If standard quantization fails because it tries to stretch uniform buckets over non-uniform data, the solution is not to change the buckets—it is to mathematically reshape the data. This is achieved through the **Principle of Incoherence**, implemented via random rotation.
@@ -62,6 +65,9 @@ Notice what happened. The extreme outlier is gone. The values are now relatively
 Because the data is now "coherent" and tightly clustered, the 4-bit quantization algorithm no longer has to stretch its buckets over a massive range. It can tightly bound the data, using tiny, highly precise step sizes.
 
 Our empirical benchmarks validate this geometric preservation. In our isolated stress tests quantizing 128-dimensional vectors down to 4-bit representation, vectors subjected to this rotation and compression round-trip maintained a **Cosine Similarity of 0.9952** against their original FP32 counterparts. The geometric meaning of the vector survives the compression almost entirely intact.
+
+> 🔬 **Go deeper:** [The Mathematics of Random Rotation — orthogonal matrices and the smearing effect](theory_incoherence.md)
+
 
 ## 4. The Core Pipeline: Weights vs. KV Cache
 
@@ -94,9 +100,7 @@ The high-precision vector is then deleted from temporary memory, and only the hi
 
 Even after applying the Principle of Incoherence, chopping a 16-bit floating-point vector down to 3 bits or 4 bits intrinsically causes data loss.
 
-*(Refer to your bucket variation diagram here)*
-
-As illustrated in the bucket size variation diagram, because the random rotation smoothed out the extreme outliers, the quantization algorithm no longer has to stretch its bins across a massive numerical range. The buckets can now tightly bound the clustered data. This drastically minimizes the rounding error, but it does not completely eliminate it. 
+Because the random rotation smoothed out the extreme outliers, the quantization algorithm no longer has to stretch its bins across a massive numerical range. The buckets can now tightly bound the clustered data. This drastically minimizes the rounding error, but it does not completely eliminate it. 
 
 If left uncorrected, these tiny compounding rounding errors would systematically bias the attention dot product ($Q \cdot K$), slowly corrupting the model's logic over a long context window. To fix this without reinflating the memory footprint, TurboQuant utilizes **Quantized Johnson-Lindenstrauss (QJL)** for real-time 1-bit error correction.
 
@@ -118,6 +122,9 @@ $$\alpha = \frac{1}{d} \sum_{i=1}^{d} |E_i|$$
 This $\alpha$ scale is stored in full FP16 precision, but because there is only one $\alpha$ value per block of dimensions, its memory footprint is effectively zero.
 
 By capturing $S$ and $\alpha$, we have approximated the error as $E \approx \alpha S$. The system immediately deletes the heavy $V_{16}$ vector from memory, pushing only the compressed $\hat{V}_q$, the bit-packed $S$, and the FP16 $\alpha$ into the VRAM. The cache is now highly compressed, but it carries the exact mathematical breadcrumbs needed to perfectly correct itself during the retrieval phase.
+
+> 🔬 **Go deeper:** [QJL Error Correction — the full bit-level mechanics](theory_qjl.md)
+
 
 ## 6. Hardware Execution: The Modified Attention Mechanism
 

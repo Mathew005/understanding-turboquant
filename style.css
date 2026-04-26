@@ -3,13 +3,13 @@
 
 /* ── Design tokens ─────────────────────────────────────────────── */
 :root {
-  --bg:          #f9f7f4;          /* warm off-white, like Medium */
+  --bg:          #f9f7f4;
   --surface:     #ffffff;
   --border:      #e5e0d8;
   --text:        #1a1a1a;
-  --text-sec:    #41464e;          /* secondary body copy */
+  --text-sec:    #41464e;
   --muted:       #6b7280;
-  --accent:      #1a8917;          /* Medium-green */
+  --accent:      #1a8917;
   --accent-dark: #0f6410;
   --link:        #1a8917;
   --code-bg:     #f2ede7;
@@ -17,8 +17,9 @@
   --font-serif:  'Lora', Georgia, 'Times New Roman', serif;
   --font-sans:   'Inter', system-ui, sans-serif;
   --font-mono:   'JetBrains Mono', 'Fira Code', monospace;
-  --max-w:       680px;
-  --topbar-h:    57px;
+  --max-w:       960px;
+  --topbar-h:    52px;
+  --sidebar-w:   252px;
 }
 
 /* ── Reset ─────────────────────────────────────────────────────── */
@@ -36,47 +37,52 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* ── Top bar (Medium-style) ────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════
+   TOP BAR
+   ══════════════════════════════════════════════════════════════ */
 #topbar {
   position: sticky;
   top: 0;
-  z-index: 100;
+  z-index: 200;
   height: var(--topbar-h);
-  background: rgba(249, 247, 244, 0.96);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: rgba(249, 247, 244, 0.97);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 0 clamp(16px, 5vw, 48px);
+  gap: 10px;
+  padding: 0 clamp(16px, 4vw, 40px);
 }
 
-#back-btn {
-  display: none;
+/* Contents toggle — leftmost item */
+#toc-toggle {
+  display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   background: none;
-  border: 1px solid var(--border);
-  color: var(--text-sec);
+  border: none;
+  color: var(--muted);
   font-family: var(--font-sans);
   font-size: 13px;
   font-weight: 500;
-  padding: 5px 14px;
-  border-radius: 999px;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
-#back-btn:hover {
+#toc-toggle:hover {
   background: #eae6e0;
-  border-color: #c8c0b6;
   color: var(--text);
 }
-#back-btn svg { flex-shrink: 0; }
+#toc-toggle svg { flex-shrink: 0; }
 
+/* Page title */
 #page-title {
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--muted);
   letter-spacing: 0.01em;
@@ -85,42 +91,124 @@ body {
   text-overflow: ellipsis;
 }
 
-/* ── Loading overlay ───────────────────────────────────────────── */
-#spinner {
+/* ══════════════════════════════════════════════════════════════
+   SIDEBAR — fixed overlay, never affects content layout
+   ══════════════════════════════════════════════════════════════ */
+#toc-sidebar {
+  position: fixed;
+  top: var(--topbar-h);
+  left: 0;
+  width: var(--sidebar-w);
+  height: calc(100vh - var(--topbar-h));
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+  z-index: 150;
+  padding: 20px 18px 40px 20px;
+  font-family: var(--font-sans);
+
+  /* Hidden by default — slides left off-screen */
+  transform: translateX(-100%);
+  transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Scrollable but no visible scrollbar */
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+#toc-sidebar::-webkit-scrollbar { display: none; }
+
+#toc-sidebar.visible {
+  transform: translateX(0);
+  box-shadow: 6px 0 24px rgba(0, 0, 0, 0.06);
+}
+
+/* Click-away backdrop (invisible on desktop, dim on mobile) */
+#toc-backdrop {
   display: none;
   position: fixed;
   inset: 0;
-  background: var(--bg);
-  z-index: 200;
-  align-items: center;
-  justify-content: center;
+  top: var(--topbar-h);
+  z-index: 140;
 }
-#spinner.active { display: flex; }
+#toc-backdrop.visible { display: block; }
 
-.spin-ring {
-  width: 36px;
-  height: 36px;
-  border: 3px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.7s linear infinite;
+/* ── TOC list ─────────────────────────────────────────────────── */
+#toc-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
 }
-@keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── Content wrapper ───────────────────────────────────────────── */
+#toc-list li { margin: 0; }
+
+#toc-list a {
+  display: block;
+  font-size: 0.87rem;
+  line-height: 1.35;
+  color: var(--text-sec);
+  text-decoration: none;
+  padding: 5px 0;
+  transition: color 0.12s;
+}
+#toc-list a:hover { color: var(--accent); }
+
+.toc-section-header {
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 14px 0 5px;
+  list-style: none;
+}
+
+.toc-divider {
+  list-style: none;
+  border-top: 1px solid var(--border);
+  margin: 8px 0 0;
+}
+
+/* Page links (series navigation) */
+.toc-page-link { font-weight: 400; }
+
+.toc-page-active {
+  color: var(--accent) !important;
+  font-weight: 600;
+}
+
+/* On-this-page heading links */
+.toc-h2 { font-weight: 500; }
+
+.toc-h3 {
+  padding-left: 10px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   CONTENT AREA — always full viewport width, never shifts
+   ══════════════════════════════════════════════════════════════ */
 #content {
   max-width: var(--max-w);
   margin: 0 auto;
-  padding: clamp(32px, 6vw, 64px) clamp(16px, 5vw, 0px) 100px;
-  animation: fadein 0.35s ease;
-}
-@keyframes fadein {
-  from { opacity: 0; transform: translateY(10px); }
+  padding: clamp(40px, 6vw, 72px) clamp(20px, 5vw, 48px) 120px;
+  
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.25s ease, transform 0.25s ease;
 }
 
-/* ── Typography — mirroring Medium's editorial feel ───────────── */
+#content.page-enter {
+  opacity: 1;
+  transform: translateY(0);
+}
 
-/* H1 = article title */
+/* ══════════════════════════════════════════════════════════════
+   TYPOGRAPHY
+   ══════════════════════════════════════════════════════════════ */
+
+/* H1 — article title */
 #content h1 {
   font-family: var(--font-serif);
   font-size: clamp(1.9rem, 5vw, 2.6rem);
@@ -132,7 +220,7 @@ body {
   margin-bottom: 0.6em;
 }
 
-/* H2 = section headers */
+/* H2 — section headers */
 #content h2 {
   font-family: var(--font-serif);
   font-size: 1.5rem;
@@ -143,17 +231,15 @@ body {
   margin-bottom: 0.5em;
 }
 
-/* H3 = sub-sections */
+/* H3 — sub-sections */
 #content h3 {
   font-family: var(--font-sans);
-  font-size: 1.05rem;
+  font-size: 0.78rem;
   font-weight: 600;
-  letter-spacing: 0.01em;
   color: var(--text-sec);
   margin-top: 2em;
   margin-bottom: 0.4em;
   text-transform: uppercase;
-  font-size: 0.78rem;
   letter-spacing: 0.12em;
 }
 
@@ -173,9 +259,9 @@ body {
   color: var(--text);
 }
 
-/* Lead paragraph — first <p> after h1 gets slightly larger */
+/* Lead paragraph */
 #content h1 + p {
-  font-size: 1.15em;
+  font-size: 1.1em;
   color: var(--text-sec);
   line-height: 1.7;
 }
@@ -187,28 +273,26 @@ body {
   border-bottom: 1px solid transparent;
   transition: border-color 0.15s;
 }
-#content a:hover {
-  border-bottom-color: var(--link);
-}
+#content a:hover { border-bottom-color: var(--link); }
 
 /* Lists */
 #content ul, #content ol {
   padding-left: 1.6em;
   margin-bottom: 1.3em;
 }
-#content li {
-  margin-bottom: 0.4em;
-}
+#content li { margin-bottom: 0.4em; }
 #content li::marker { color: var(--muted); }
 
-/* Blockquote — Medium callout style */
+/* Blockquote */
 #content blockquote {
-  border-left: 3px solid var(--text);
+  border-left: 3px solid var(--accent);
   padding: 4px 0 4px 20px;
   margin: 1.8em 0;
   color: var(--text-sec);
   font-style: italic;
   font-size: 0.95em;
+  background: rgba(26, 137, 23, 0.04);
+  border-radius: 0 var(--radius) var(--radius) 0;
 }
 #content blockquote p { margin-bottom: 0; }
 
@@ -236,7 +320,7 @@ body {
 #content pre {
   background: #1e1e1e;
   border-radius: 6px;
-  padding: 20px 22px;
+  padding: 18px 20px;
   overflow-x: auto;
   white-space: pre;
   margin: 1.8em 0;
@@ -281,17 +365,17 @@ body {
   margin: 2em auto;
 }
 
-/* Strong / bold */
+/* Strong */
 #content strong { font-weight: 700; color: var(--text); }
 
-/* KaTeX math */
+/* KaTeX */
 .katex-display {
   overflow-x: auto;
   padding: 8px 0;
   margin: 1.2em 0;
 }
 
-/* Mermaid diagrams */
+/* Mermaid */
 .mermaid-wrapper {
   margin: 2em 0;
   overflow-x: auto;
@@ -301,4 +385,24 @@ body {
   max-width: 100%;
   height: auto;
   border-radius: var(--radius);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MOBILE
+   ══════════════════════════════════════════════════════════════ */
+@media (max-width: 720px) {
+  body { font-size: 17px; }
+
+  /* On mobile the backdrop dims the page */
+  #toc-backdrop.visible {
+    background: rgba(0, 0, 0, 0.25);
+  }
+
+  #content {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  #content h1 { font-size: 1.65rem; }
+  #content h2 { font-size: 1.2rem; }
 }

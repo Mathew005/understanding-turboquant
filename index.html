@@ -5,16 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Understanding TurboQuant</title>
 
-  <!-- Stylesheet -->
   <link rel="stylesheet" href="style.css">
-
-  <!-- Marked.js – markdown parsing -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-
-  <!-- Mermaid.js – diagram rendering -->
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-
-  <!-- KaTeX – math rendering -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
@@ -24,23 +17,30 @@
 
 <!-- Top navigation bar -->
 <nav id="topbar">
-  <button id="back-btn" onclick="navigateTo('README.md')" aria-label="Back to main article">
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M10 13L5 8l5-5"/>
+  <!-- Contents toggle — left side, opens sidebar below it -->
+  <button id="toc-toggle" onclick="toggleTOC()" aria-label="Toggle contents">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+      <line x1="3" y1="6"  x2="21" y2="6"/>
+      <line x1="3" y1="12" x2="21" y2="12"/>
+      <line x1="3" y1="18" x2="21" y2="18"/>
     </svg>
-    Back
+    Contents
   </button>
+
   <span id="page-title">Understanding TurboQuant</span>
 </nav>
 
-<!-- Loading overlay -->
-<div id="spinner"><div class="spin-ring"></div></div>
+<!-- Sidebar — fixed overlay, slides in below topbar -->
+<aside id="toc-sidebar">
+  <ul id="toc-list"></ul>
+</aside>
+<!-- Click-away backdrop (mobile) -->
+<div id="toc-backdrop" onclick="toggleTOC()"></div>
 
-<!-- Rendered markdown lands here -->
+
+<!-- Main content -->
 <main id="content"></main>
 
-<!-- App logic -->
 <script src="app.js"></script>
-
 </body>
 </html>
