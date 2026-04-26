@@ -245,7 +245,7 @@ body[data-page="README.md"] #content .hero-sticky {
 
 body[data-page="README.md"] #content .hero-sticky h1 {
   font-family: var(--font-serif);
-  font-size: clamp(4rem, 12vw, 7.8rem);
+  font-size: clamp(2.5rem, 13vw, 7.8rem);
   line-height: 1.05;
   margin: 0 0 0.1em 0;
   color: var(--text);
@@ -383,6 +383,9 @@ body[data-page="README.md"] #content .hero-sticky .authors {
   margin: 1.8em 0;
   font-family: var(--font-sans);
   font-size: 0.88em;
+  display: block;
+  overflow-x: auto;
+  white-space: nowrap;
 }
 #content th {
   background: var(--surface);
@@ -447,4 +450,15 @@ body[data-page="README.md"] #content .hero-sticky .authors {
 
   #content h1 { font-size: 1.65rem; }
   #content h2 { font-size: 1.2rem; }
+
+  /* Adjust hero container negative margins to match mobile padding */
+  body[data-page="README.md"] #content .hero-container {
+    margin-left: -18px;
+    margin-right: -18px;
+  }
+  
+  body[data-page="README.md"] #content .hero-sticky {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
 }
