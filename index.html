@@ -1,22 +1,46 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Documentation</title>
-    <!-- Simple.css for styling -->
-    <link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css">
-    <!-- Marked.js for markdown parsing -->
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Understanding TurboQuant</title>
+
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Marked.js – markdown parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <!-- Mermaid.js – diagram rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+
+  <!-- KaTeX – math rendering -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    onload="renderMathOnPage()"></script>
 </head>
 <body>
-    <main id="content"></main>
-    <script>
-        fetch('README.md')
-            .then(response => response.text())
-            .then(markdown => {
-                document.getElementById('content').innerHTML = marked.parse(markdown);
-            });
-    </script>
+
+<!-- Top navigation bar -->
+<nav id="topbar">
+  <button id="back-btn" onclick="navigateTo('README.md')" aria-label="Back to main article">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M10 13L5 8l5-5"/>
+    </svg>
+    Back
+  </button>
+  <span id="page-title">Understanding TurboQuant</span>
+</nav>
+
+<!-- Loading overlay -->
+<div id="spinner"><div class="spin-ring"></div></div>
+
+<!-- Rendered markdown lands here -->
+<main id="content"></main>
+
+<!-- App logic -->
+<script src="app.js"></script>
+
 </body>
 </html>
