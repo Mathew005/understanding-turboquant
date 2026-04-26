@@ -1,22 +1,46 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Documentation</title>
-    <!-- Simple.css for styling -->
-    <link rel="stylesheet" href="https://cdn.simplecss.org/simple.min.css">
-    <!-- Marked.js for markdown parsing -->
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Understanding TurboQuant</title>
+
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+    onload="renderMathOnPage()"></script>
 </head>
 <body>
-    <main id="content"></main>
-    <script>
-        fetch('README.md')
-            .then(response => response.text())
-            .then(markdown => {
-                document.getElementById('content').innerHTML = marked.parse(markdown);
-            });
-    </script>
+
+<!-- Top navigation bar -->
+<nav id="topbar">
+  <!-- Contents toggle — left side, opens sidebar below it -->
+  <button id="toc-toggle" onclick="toggleTOC()" aria-label="Toggle contents">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+      <line x1="3" y1="6"  x2="21" y2="6"/>
+      <line x1="3" y1="12" x2="21" y2="12"/>
+      <line x1="3" y1="18" x2="21" y2="18"/>
+    </svg>
+    Contents
+  </button>
+
+  <span id="page-title">Understanding TurboQuant</span>
+</nav>
+
+<!-- Sidebar — fixed overlay, slides in below topbar -->
+<aside id="toc-sidebar">
+  <ul id="toc-list"></ul>
+</aside>
+<!-- Click-away backdrop (mobile) -->
+<div id="toc-backdrop" onclick="toggleTOC()"></div>
+
+
+<!-- Main content -->
+<main id="content"></main>
+
+<script src="app.js"></script>
 </body>
 </html>
