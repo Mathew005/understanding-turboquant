@@ -3,7 +3,7 @@ const HOME = 'README.md';
 
 const PAGES = {
   'README.md': 'Understanding TurboQuant',
-  'pyturboquant Benchmark Report.md': 'pyturboquant Benchmark Report',
+  'benchmarks.md': 'Benchmarking pyturboquant',
 };
 
 /* ── Marked options ─────────────────────────────────────── */
