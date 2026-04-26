@@ -218,6 +218,30 @@ body {
   color: var(--text);
   margin-top: 0;
   margin-bottom: 0.6em;
+  transition: font-size 0.6s cubic-bezier(0.22, 1, 0.36, 1), margin-bottom 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Dynamic Heading for README.md */
+body[data-page="README.md"]:not(.scrolled) #content h1:first-child {
+  font-size: clamp(4rem, 12vw, 7.8rem);
+  margin-bottom: 0.1em;
+  line-height: 1.05;
+}
+
+/* Authors Subtitle */
+#content .authors {
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  color: var(--text-sec);
+  margin-top: -0.4em;
+  margin-bottom: 2em;
+  font-weight: 500;
+  transition: font-size 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+body[data-page="README.md"]:not(.scrolled) #content .authors {
+  font-size: 1.25rem;
+  opacity: 0.85;
 }
 
 /* H2 — section headers */

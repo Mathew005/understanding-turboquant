@@ -193,6 +193,7 @@ async function loadPage(file) {
     // Update chrome
     document.title  = PAGES[file] || file;
     titleEl.textContent = PAGES[file] || file;
+    document.body.setAttribute('data-page', file);
 
     // Rebuild TOC for this page
     generateTOC(file);
@@ -232,6 +233,15 @@ document.getElementById('content').addEventListener('click', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') closeSidebar();
 });
+
+/* ── Scroll listener for dynamic heading ────────────────── */
+window.addEventListener('scroll', () => {
+  if (window.scrollY > 40) {
+    document.body.classList.add('scrolled');
+  } else {
+    document.body.classList.remove('scrolled');
+  }
+}, { passive: true });
 
 /* ── Hash-change router ─────────────────────────────────── */
 window.addEventListener('hashchange', () => loadPage(hashToFile()));
