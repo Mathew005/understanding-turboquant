@@ -1,4 +1,4 @@
-# learning-turboquant
+# understanding-turboquant
 
 ### Proposed Article Structure: *Learning TurboQuant*
 
