@@ -31,6 +31,8 @@ Every value between $-1$ and $1$ (which constitutes 99% of the important, nuance
 
 When this vector is used to compute attention scores ($Q \cdot K$), the loss of precision in the non-outlier channels leads to catastrophic degradation in the model's reasoning capabilities.
 
+![Comparative Clamping Behavior](assets/1_Comparitive_clamping_behaviour_roatated%20quantization_meth.png)
+
 ## The Need for a Pre-conditioning Step
 
 Since the model fundamentally requires the information encoded in these outliers, we cannot simply clip them (cap them at a lower value). If we clip the outlier, the model loses its syntax marker. If we keep the outlier, uniform quantization destroys the rest of the vector. 

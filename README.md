@@ -36,6 +36,8 @@ TurboQuant achieves this through the **Principle of Incoherence**. Before quanti
 
 Because the data is now uniform and tightly clustered, the 4-bit quantization algorithm can bound the data tightly, using tiny, highly precise step sizes. The geometric meaning of the vector survives the compression almost entirely intact.
 
+![Comparative Clamping Behavior](assets/1_Comparitive_clamping_behaviour_roatated%20quantization_meth.png)
+
 > 🔬 **Go deeper:** [The Mathematics of Random Rotation — orthogonal matrices and the smearing effect](theory_incoherence.md)
 
 ---
@@ -75,6 +77,8 @@ When generating the next word, the attention layer must take the dot product of 
 The custom CUDA kernel splits this into a primary calculation and a high-speed correction. First, it computes the dot product using the compressed Key vector to get a fast, base attention score. Simultaneously, it uses blisteringly fast bitwise addition/subtraction to calculate the correction term using our saved 1-bit direction ($S$) and scalar ($\alpha$).
 
 **The Memory Bandwidth Paradox:** Doing this extra error-correction math actually makes the model faster. Modern GPUs are entirely bottlenecked by memory fetch times. By shrinking the data by 75%, we drastically reduce the time the GPU spends waiting for memory to arrive. The tiny fraction of a microsecond it takes to run the bitwise correction is entirely absorbed by the massive time saved on the memory fetch, resulting in a net acceleration.
+
+![TurboQuant Hardware Architecture](assets/Turbo_quant_architecture_in_attention_mechanism.png)
 
 ---
 

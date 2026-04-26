@@ -68,8 +68,9 @@ Cosine Similarity:  0.9952 (1.0 is perfect)
 | MSE | 0.0101 |
 | **Cosine Similarity** | **0.9952** |
 
-> [!NOTE]
 > A cosine similarity of 0.9952 means the reconstructed vector points in virtually the same direction as the original. The quantization "loss" is negligible for downstream tasks like similarity search.
+
+![Comparative Clamping Behavior](assets/1_Comparitive_clamping_behaviour_roatated%20quantization_meth.png)
 
 ---
 
@@ -247,6 +248,8 @@ Both methods scale **linearly** with vector count (brute-force O(n) scan). At 1M
 
 ### Consistent Finding: 7.7x Memory Savings, ~90% Recall@1, ~98% Recall@10
 Across all experiments — from 10 sentences to 1,000,000 vectors, on both CPU and GPU — TurboQuant consistently achieved **7.7x compression** at 4-bit quantization with **~90% Recall@1** and **~98% Recall@10**, measured across 50 diverse queries.
+
+![TurboQuant Hardware Architecture](assets/Turbo_quant_architecture_in_attention_mechanism.png)
 
 ### The Trade-off Matrix
 

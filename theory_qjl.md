@@ -45,3 +45,5 @@ The genius of this approach lies in how hardware executes $\alpha(Q \cdot S)$.
 Because $S$ only contains $+1$ and $-1$, computing $Q \cdot S$ **requires no multiplication**. The CUDA kernel simply iterates over the Query dimensions and performs bitwise addition or subtraction based on the packed bits in $S$. 
 
 This bitwise logic executes at blistering speed on modern GPUs. We get the accuracy recovery of an FP16 error-correction pass, executed using the latency profile of an integer addition.
+
+![TurboQuant Hardware Architecture](assets/Turbo_quant_architecture_in_attention_mechanism.png)

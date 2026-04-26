@@ -35,3 +35,5 @@ Once the data resembles a Gaussian distribution, extreme outliers are gone. The 
 When we apply Uniform Quantization (or Lloyd-Max quantization, which is optimized for Gaussian data) to this rotated vector, the step size between buckets becomes very small. The quantization grid tightly bounds the data, resulting in dramatically less rounding error.
 
 By "unzipping" the matrix math, we've solved the outlier problem purely geometrically, allowing 4-bit compression to succeed where it previously failed.
+
+![Rotation and Clamping Behavior](assets/1_Comparitive_clamping_behaviour_roatated%20quantization_meth.png)

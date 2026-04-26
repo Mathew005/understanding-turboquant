@@ -64,8 +64,9 @@ Cosine Similarity:  0.9952 (1.0 is perfect)
 | MSE | 0.0101 |
 | **Cosine Similarity** | **0.9952** |
 
-> [!NOTE]
 > A cosine similarity of 0.9952 means the reconstructed vector points in virtually the same direction as the original. The quantization "loss" is negligible for downstream tasks like similarity search.
+
+![Comparative Clamping Behavior](assets/1_Comparitive_clamping_behaviour_roatated%20quantization_meth.png)
 
 ---
 
