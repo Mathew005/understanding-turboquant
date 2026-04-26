@@ -236,9 +236,9 @@ document.addEventListener('keydown', e => {
 
 /* ── Scroll listener for dynamic heading ────────────────── */
 window.addEventListener('scroll', () => {
-  if (window.scrollY > 40) {
+  if (window.scrollY > 120) {
     document.body.classList.add('scrolled');
-  } else {
+  } else if (window.scrollY < 20) {
     document.body.classList.remove('scrolled');
   }
 }, { passive: true });
