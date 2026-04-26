@@ -218,29 +218,47 @@ body {
   color: var(--text);
   margin-top: 0;
   margin-bottom: 0.6em;
-  transition: font-size 0.15s ease-out, margin-bottom 0.15s ease-out;
 }
 
-/* Dynamic Heading for README.md */
-body[data-page="README.md"]:not(.scrolled) #content h1:first-child {
+/* ══════════════════════════════════════════════════════════════
+   HERO PARALLAX SECTION
+   ══════════════════════════════════════════════════════════════ */
+
+body[data-page="README.md"] #content .hero-container {
+  height: calc(100vh - var(--topbar-h));
+  margin-top: calc(-1 * clamp(40px, 6vw, 72px));
+  margin-left: calc(-1 * clamp(20px, 5vw, 48px));
+  margin-right: calc(-1 * clamp(20px, 5vw, 48px));
+  display: block;
+}
+
+body[data-page="README.md"] #content .hero-spacer {
+  height: 35vh;
+}
+
+body[data-page="README.md"] #content .hero-sticky {
+  position: sticky;
+  top: calc(35vh + var(--topbar-h));
+  text-align: center;
+  padding: 0 clamp(20px, 5vw, 48px); /* Restore content padding inside sticky */
+}
+
+body[data-page="README.md"] #content .hero-sticky h1 {
+  font-family: var(--font-serif);
   font-size: clamp(4rem, 12vw, 7.8rem);
-  margin-bottom: 0.1em;
   line-height: 1.05;
+  margin: 0 0 0.1em 0;
+  color: var(--text);
+  font-weight: 700;
+  letter-spacing: -0.02em;
 }
 
-/* Authors Subtitle */
-#content .authors {
+body[data-page="README.md"] #content .hero-sticky .authors {
   font-family: var(--font-sans);
-  font-size: 0.95rem;
-  color: var(--text-sec);
-  margin-top: -0.4em;
-  margin-bottom: 2em;
-  font-weight: 500;
-  transition: font-size 0.15s ease-out, opacity 0.15s ease-out;
-}
-
-body[data-page="README.md"]:not(.scrolled) #content .authors {
   font-size: 1.25rem;
+  color: var(--text-sec);
+  margin: -0.4em 0 0 0;
+  font-weight: 500;
   opacity: 0.85;
 }
 

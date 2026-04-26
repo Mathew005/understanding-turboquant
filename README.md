@@ -1,5 +1,10 @@
-# Understanding TurboQuant
+<div class="hero-container">
+<div class="hero-spacer"></div>
+<div class="hero-sticky">
+<h1>Understanding TurboQuant</h1>
 <p class="authors">By Mathew Saju and Amal Baby Mathews</p>
+</div>
+</div>
 
 ## 1. Introduction: The Context Window Bottleneck
 
