@@ -25,6 +25,11 @@
 * *(Rephrases your "How it affects fetching smaller bit vectors...")*
 * **Focus:** The climax of the article. Explain the dual dot-product calculation. Show how the Query ($Q$) multiplies against the 3-bit Keys ($K$), and simultaneously runs a lightning-fast bitwise calculation against the 1-bit error signs to mathematically correct the final attention score. Explain why doing *more* math is actually faster because it avoids the memory bandwidth bottleneck.
 
-**7. Conclusion**
-* **Focus:** Summarize the net benefit: getting 16-bit accuracy with a 4-bit memory footprint, enabling massive batch sizes and infinite context windows on consumer hardware.
+**Section 7: Beyond LLMs: TurboQuant in Vector Databases**
+* **The Conceptual Bridge:** Explain that a Vector Database is functionally identical to a persistent KV cache. 
+* **Storage & Retrieval:** Detail how rotating and compressing standard embeddings (without touching the embedding model) shrinks database size by up to 32x. Explain how using `XOR` and `POPCNT` for the dot product search drastically drops retrieval latency.
+* **Fixing the Ingestion Bottleneck:** Address the pipeline phase. Explain how quantizing the embedding model's weights independently solves the *ingestion delay* by allowing massive batch processing of document chunks.
+
+**8. Conclusion**
+* Summarize the ultimate impact: TurboQuant principles allow engineers to run infinite context windows on local GPUs *and* search billion-scale vector databases with millisecond latency, fundamentally changing the economics of AI hardware.
 
