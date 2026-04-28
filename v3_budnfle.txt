@@ -1,0 +1,2428 @@
+TurboQuant Project Bundle
+============================================================
+
+################################################################################
+FILE: pyturboquant\core\codebook.py
+################################################################################
+
+"""Lloyd-Max codebook solver and precomputed codebook loading.
+
+The codebooks are precomputed for a standard Gaussian N(0,1) and scaled
+by 1/sqrt(d) at load time to match the sphere coordinate distribution.
+
+Shipped ``pyturboquant/data/codebooks/*.pt`` files cover common bit-widths so runtime
+never needs SciPy. SciPy is only used when those files are missing and
+``bits > 4`` (iterative Lloyd--Max) or when computing ``mse_cost`` without
+cached values.
+"""
+
+from __future__ import annotations
+
+import math
+from collections import OrderedDict
+from pathlib import Path
+
+import torch
+
+from pyturboquant.core.types import Codebook
+
+_CODEBOOK_CACHE: dict[int, Codebook] = {}
+_SCALED_CODEBOOK_CACHE: OrderedDict[tuple[int, int, str], Codebook] = OrderedDict()
+_MAX_SCALED_CODEBOOK_CACHE = 256
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "codebooks"
+
+
+def _compute_gaussian_codebook(bits: int) -> Codebook:
+    """Compute the Lloyd-Max optimal codebook for N(0,1) at a given bit-width.
+
+    Falls back to a closed-form/hardcoded solution for common bit-widths
+    and uses iterative Lloyd-Max for higher bit-widths.
+    """
+    n_levels = 1 << bits
+
+    # Hardcoded optimal centroids for N(0,1) from the paper / numerical computation
+    known: dict[int, list[float]] = {
+        1: [-0.7978845608, 0.7978845608],
+        2: [-1.5104176088, -0.4527800398, 0.4527800398, 1.5104176088],
+        3: [
+            -2.1519742685, -1.3439092613, -0.7560052489, -0.2451209529,
+            0.2451209529, 0.7560052489, 1.3439092613, 2.1519742685,
+        ],
+        4: [
+            -2.7326368225, -2.0690571770, -1.6180378132, -1.2561836443,
+            -0.9423401764, -0.6567588956, -0.3880170670, -0.1284042432,
+            0.1284042432, 0.3880170670, 0.6567588956, 0.9423401764,
+            1.2561836443, 1.6180378132, 2.0690571770, 2.7326368225,
+        ],
+    }
+
+    if bits in known:
+        centroids = torch.tensor(known[bits], dtype=torch.float64)
+    else:
+        centroids = _lloyd_max_gaussian(n_levels)
+
+    boundaries = (centroids[:-1] + centroids[1:]) / 2.0
+
+    # Compute MSE cost for N(0,1)
+    mse = _compute_mse_cost(centroids.tolist(), boundaries.tolist())
+
+    return Codebook(
+        centroids=centroids.float(),
+        boundaries=boundaries.float(),
+        bits=bits,
+        mse_cost=mse,
+    )
+
+
+def _lloyd_max_gaussian(n_levels: int, max_iter: int = 500, tol: float = 1e-14) -> torch.Tensor:
+    """Iterative Lloyd-Max for N(0,1). Used for bit-widths > 4."""
+    try:
+        from scipy import integrate
+        from scipy.stats import norm
+    except ImportError as e:
+        raise ImportError(
+            "scipy is required for computing codebooks with bits > 4. "
+            "Install with: pip install pyturboquant[dev]"
+        ) from e
+
+    # Initialize centroids uniformly over [-4, 4]
+    centroids = [(-4.0 + (2 * i + 1) * 8.0 / n_levels) for i in range(n_levels)]
+
+    for _ in range(max_iter):
+        boundaries = [(centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)]
+        edges = [float("-inf"), *boundaries, float("inf")]
+
+        new_centroids = []
+        for i in range(n_levels):
+            lo, hi = edges[i], edges[i + 1]
+            num, _ = integrate.quad(lambda x: x * norm.pdf(x), lo, hi)
+            den, _ = integrate.quad(lambda x: norm.pdf(x), lo, hi)
+            new_centroids.append(num / den if den > 1e-30 else centroids[i])
+
+        delta = max(abs(a - b) for a, b in zip(centroids, new_centroids, strict=True))
+        centroids = new_centroids
+        if delta < tol:
+            break
+
+    return torch.tensor(centroids, dtype=torch.float64)
+
+
+def _compute_mse_cost(centroids: list[float], boundaries: list[float]) -> float:
+    """Compute the MSE cost of a codebook against N(0,1)."""
+    try:
+        from scipy import integrate
+        from scipy.stats import norm
+    except ImportError:
+        # Return a placeholder; exact MSE requires scipy
+        return float("nan")
+
+    n = len(centroids)
+    edges = [float("-inf"), *list(boundaries), float("inf")]
+    total_mse = 0.0
+    for i in range(n):
+        lo, hi = edges[i], edges[i + 1]
+        c = centroids[i]
+        val, _ = integrate.quad(lambda x, _c=c: (x - _c) ** 2 * norm.pdf(x), lo, hi)
+        total_mse += val
+    return total_mse
+
+
+def get_codebook(dim: int, bits: int, device: torch.device | None = None) -> Codebook:
+    """Load or compute a codebook scaled for dimension d.
+
+    Centroids and boundaries are scaled by 1/sqrt(d) to match the variance
+    of coordinates on S^{d-1}.
+
+    Args:
+        dim: Vector dimension d.
+        bits: Bit-width b (1-8).
+        device: Target torch device.
+
+    Returns:
+        Codebook with centroids/boundaries scaled to dimension d.
+    """
+    if bits < 1 or bits > 8:
+        raise ValueError(f"bits must be in [1, 8], got {bits}")
+
+    if bits not in _CODEBOOK_CACHE:
+        pt_path = _DATA_DIR / f"gaussian_b{bits}.pt"
+        if pt_path.exists():
+            data = torch.load(pt_path, weights_only=True)
+            _CODEBOOK_CACHE[bits] = Codebook(
+                centroids=data["centroids"].float(),
+                boundaries=data["boundaries"].float(),
+                bits=bits,
+                mse_cost=float(data.get("mse_cost", float("nan"))),
+            )
+        else:
+            _CODEBOOK_CACHE[bits] = _compute_gaussian_codebook(bits)
+
+    dev = device or torch.device("cpu")
+    scaled_key = (bits, dim, str(dev))
+    if scaled_key in _SCALED_CODEBOOK_CACHE:
+        _SCALED_CODEBOOK_CACHE.move_to_end(scaled_key)
+        return _SCALED_CODEBOOK_CACHE[scaled_key]
+
+    base = _CODEBOOK_CACHE[bits]
+    scale = 1.0 / math.sqrt(dim)
+    scaled = Codebook(
+        centroids=(base.centroids * scale).to(dev),
+        boundaries=(base.boundaries * scale).to(dev),
+        bits=bits,
+        mse_cost=base.mse_cost / dim,
+    )
+    _SCALED_CODEBOOK_CACHE[scaled_key] = scaled
+    while len(_SCALED_CODEBOOK_CACHE) > _MAX_SCALED_CODEBOOK_CACHE:
+        _SCALED_CODEBOOK_CACHE.popitem(last=False)
+    return scaled
+
+
+################################################################################
+FILE: pyturboquant\core\mse_quantizer.py
+################################################################################
+
+"""MSE-optimal TurboQuant quantizer (Algorithm 1 of the paper).
+
+Performs: normalize -> random rotate -> per-coordinate scalar quantize -> pack.
+Dequantize reverses the process.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from pyturboquant.core.codebook import get_codebook
+from pyturboquant.core.packed import pack_indices, unpack_indices
+from pyturboquant.core.rotation import RandomRotation
+from pyturboquant.core.types import Codebook, QuantizedMSE
+
+
+class MSEQuantizer:
+    """Data-oblivious MSE-optimal vector quantizer.
+
+    Applies a seeded random rotation then per-coordinate Lloyd-Max quantization
+    at the given bit-width.  The distortion approaches the Shannon lower bound
+    1/(d * 4^b) for large d (Theorem 1).
+
+    Args:
+        dim: Vector dimension d.
+        bits: Bit-width b (1-8).
+        seed: Deterministic seed for the rotation matrix.
+        device: Torch device.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bits: int,
+        seed: int = 0,
+        device: torch.device | None = None,
+    ) -> None:
+        self.dim = dim
+        self.bits = bits
+        self.seed = seed
+        self.device = device or torch.device("cpu")
+        self._rotation = RandomRotation(dim, seed=seed, device=self.device)
+        self._codebook: Codebook = get_codebook(dim, bits, device=self.device)
+
+    @property
+    def codebook(self) -> Codebook:
+        return self._codebook
+
+    def quantize(self, x: torch.Tensor) -> QuantizedMSE:
+        """Quantize vectors using Algorithm 1 (MSE TurboQuant).
+
+        Args:
+            x: Input tensor of shape (*, d).
+
+        Returns:
+            QuantizedMSE holding packed indices and norms.
+        """
+        leading = x.shape[:-1]
+        d = x.shape[-1]
+        if d != self.dim:
+            raise ValueError(f"Expected dim={self.dim}, got {d}")
+
+        flat = x.reshape(-1, d)
+        norms = torch.linalg.norm(flat, dim=-1, keepdim=True)
+        safe_norms = norms.clamp(min=1e-12)
+        normalized = flat / safe_norms
+
+        rotated = self._rotation.forward(normalized)
+
+        boundaries = self._codebook.boundaries
+        indices = torch.searchsorted(boundaries, rotated)
+        indices = indices.clamp(0, (1 << self.bits) - 1).to(torch.int32)
+
+        packed = pack_indices(indices.reshape(-1), self.bits)
+
+        return QuantizedMSE(
+            packed_indices=packed,
+            norms=norms.reshape(*leading, 1),
+            dim=self.dim,
+            bits=self.bits,
+            seed=self.seed,
+            device=self.device,
+        )
+
+    def quantize_with_reconstruction(
+        self, x: torch.Tensor
+    ) -> tuple[QuantizedMSE, torch.Tensor]:
+        """Same as ``quantize``, but also returns the MSE reconstruction without pack/unpack.
+
+        Avoids an extra dequantize pass when the caller needs ``x_hat`` immediately
+        (for example inner-product quantization of the residual).
+        """
+        leading = x.shape[:-1]
+        d = x.shape[-1]
+        if d != self.dim:
+            raise ValueError(f"Expected dim={self.dim}, got {d}")
+
+        flat = x.reshape(-1, d)
+        norms = torch.linalg.norm(flat, dim=-1, keepdim=True)
+        safe_norms = norms.clamp(min=1e-12)
+        normalized = flat / safe_norms
+
+        rotated = self._rotation.forward(normalized)
+
+        boundaries = self._codebook.boundaries
+        indices = torch.searchsorted(boundaries, rotated)
+        indices = indices.clamp(0, (1 << self.bits) - 1).to(torch.int32)
+
+        centroids = self._codebook.centroids[indices]
+        rotated_back = self._rotation.inverse(centroids)
+        x_hat = (rotated_back * safe_norms).reshape(*leading, d)
+
+        packed = pack_indices(indices.reshape(-1), self.bits)
+        qt = QuantizedMSE(
+            packed_indices=packed,
+            norms=norms.reshape(*leading, 1),
+            dim=self.dim,
+            bits=self.bits,
+            seed=self.seed,
+            device=self.device,
+        )
+        return qt, x_hat
+
+    def dequantize(self, qt: QuantizedMSE) -> torch.Tensor:
+        """Reconstruct vectors from quantized representation.
+
+        Args:
+            qt: Quantized representation from quantize().
+
+        Returns:
+            Reconstructed tensor of shape matching the original input.
+        """
+        n_vectors = qt.norms.reshape(-1).shape[0]
+        count = n_vectors * self.dim
+
+        indices = unpack_indices(qt.packed_indices, qt.bits, count)
+        centroids = self._codebook.centroids
+        reconstructed = centroids[indices.long()].reshape(n_vectors, self.dim)
+
+        rotated_back = self._rotation.inverse(reconstructed)
+
+        norms_flat = qt.norms.reshape(n_vectors, 1)
+        return (rotated_back * norms_flat).reshape(*qt.norms.shape[:-1], self.dim)
+
+    def dequantize_range(
+        self, qt: QuantizedMSE, start: int, end: int
+    ) -> torch.Tensor:
+        """Reconstruct vectors in the index range ``[start, end)`` without materializing the full chunk.
+
+        When ``dim * qt.bits`` is a multiple of 8, each vector occupies an integer
+        number of bytes in ``qt.packed_indices``, enabling cheap byte-aligned
+        slicing of the packed buffer so peak fp32 memory during reconstruction
+        is bounded by ``(end - start) * dim * 4`` bytes. When the product is
+        not a multiple of 8 (e.g. an awkward ``dim`` that isn't divisible by 8
+        for the given bit-width) this falls back to a full ``dequantize`` plus
+        slice so correctness is preserved.
+
+        Args:
+            qt: Quantized representation from quantize().
+            start: Inclusive start vector index.
+            end: Exclusive end vector index.
+
+        Returns:
+            Reconstructed tensor of shape ``(end - start, dim)``.
+        """
+        n_total = qt.norms.reshape(-1).shape[0]
+        if not (0 <= start <= end <= n_total):
+            raise ValueError(
+                f"Invalid range [{start}, {end}) for chunk of size {n_total}"
+            )
+        m = end - start
+        if m == 0:
+            return torch.empty(0, self.dim, device=self.device, dtype=torch.float32)
+
+        bits = qt.bits
+        total_bits_per_vec = self.dim * bits
+
+        if total_bits_per_vec % 8 != 0:
+            full = self.dequantize(qt).reshape(-1, self.dim)
+            return full[start:end]
+
+        bytes_per_vec = total_bits_per_vec // 8
+        packed_sub = qt.packed_indices[
+            start * bytes_per_vec : end * bytes_per_vec
+        ]
+        indices = unpack_indices(packed_sub, bits, m * self.dim)
+        centroids = self._codebook.centroids
+        reconstructed = centroids[indices.long()].reshape(m, self.dim)
+
+        rotated_back = self._rotation.inverse(reconstructed)
+        norms_slice = qt.norms.reshape(-1)[start:end].unsqueeze(-1)
+        return rotated_back * norms_slice
+
+
+################################################################################
+FILE: pyturboquant\core\packed.py
+################################################################################
+
+"""Bit-packing utilities for compact storage of b-bit quantization indices.
+
+Packs b-bit integers into uint8 tensors for memory-efficient storage.
+"""
+
+from __future__ import annotations
+
+import torch
+
+
+def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack b-bit index values into a compact uint8 tensor.
+
+    Args:
+        indices: Integer tensor with values in [0, 2^bits). Shape (*, d).
+        bits: Number of bits per index (1-8).
+
+    Returns:
+        Packed uint8 tensor. Shape (ceil(n * bits / 8),) for n = indices.numel().
+    """
+    if bits < 1 or bits > 8:
+        raise ValueError(f"bits must be in [1, 8], got {bits}")
+    if bits == 8:
+        return indices.reshape(-1).to(torch.uint8)
+
+    flat = indices.reshape(-1).to(torch.int64)
+    device = flat.device
+    n = flat.numel()
+    if n == 0:
+        return torch.zeros(0, dtype=torch.uint8, device=device)
+
+    k_arange = torch.arange(bits, device=device, dtype=torch.int64)
+    bit_vals = ((flat.unsqueeze(-1) >> k_arange) & 1).to(torch.uint8)
+    bits_stream = bit_vals.reshape(-1)
+    total_bits = bits_stream.numel()
+    n_bytes = (total_bits + 7) // 8
+    pad_len = n_bytes * 8 - total_bits
+    if pad_len:
+        bits_stream = torch.cat(
+            [bits_stream, torch.zeros(pad_len, dtype=torch.uint8, device=device)]
+        )
+    reshaped = bits_stream.view(n_bytes, 8)
+    shifts = torch.arange(8, device=device, dtype=torch.int32)
+    return (reshaped.to(torch.int32) << shifts).sum(dim=1).to(torch.uint8)
+
+
+def unpack_indices(packed: torch.Tensor, bits: int, count: int) -> torch.Tensor:
+    """Unpack b-bit index values from a compact uint8 tensor.
+
+    Args:
+        packed: Packed uint8 tensor from pack_indices.
+        bits: Number of bits per index (1-8).
+        count: Number of indices to unpack.
+
+    Returns:
+        Integer tensor of shape (count,) with values in [0, 2^bits).
+    """
+    if bits < 1 or bits > 8:
+        raise ValueError(f"bits must be in [1, 8], got {bits}")
+    if bits == 8:
+        return packed[:count].reshape(-1).to(torch.int32)
+
+    device = packed.device
+    if count == 0:
+        return torch.zeros(0, dtype=torch.int32, device=device)
+
+    total_bits = count * bits
+    shifts_u8 = torch.arange(8, device=device, dtype=torch.uint8)
+    bits_from_bytes = ((packed.unsqueeze(-1) >> shifts_u8) & 1).reshape(-1)
+    stream = bits_from_bytes[:total_bits].to(torch.int64)
+    mat = stream.view(count, bits)
+    powers = 1 << torch.arange(bits, device=device, dtype=torch.int64)
+    return (mat * powers).sum(dim=-1).to(torch.int32)
+
+
+def pack_bits(signs: torch.Tensor) -> torch.Tensor:
+    """Pack a boolean/int8 sign tensor into uint8 bitfield.
+
+    Args:
+        signs: Tensor of 0/1 or -1/+1 values. Any shape; values are packed in
+        flattened (row-major) order into a single 1D uint8 tensor.
+
+    Returns:
+        Packed uint8 tensor. Shape (ceil(signs.numel() / 8),).
+    """
+    flat = (signs.reshape(-1) > 0).to(torch.uint8)
+    n = flat.numel()
+    n_bytes = (n + 7) // 8
+    padded = torch.zeros(n_bytes * 8, dtype=torch.uint8, device=signs.device)
+    padded[:n] = flat
+
+    reshaped = padded.reshape(n_bytes, 8)
+    shifts = torch.arange(8, device=signs.device, dtype=torch.int32)
+    return (reshaped.to(torch.int32) << shifts).sum(dim=1).to(torch.uint8)
+
+
+def pack_bits_batch(signs: torch.Tensor) -> torch.Tensor:
+    """Vectorized sign packing for a batch of shape (n, d)."""
+    if signs.ndim < 2:
+        raise ValueError("pack_bits_batch expects signs of shape (n, d)")
+    n, m = signs.shape
+    device = signs.device
+    flat = (signs > 0).to(torch.uint8)
+    n_bytes = (m + 7) // 8
+    padded_cols = n_bytes * 8
+    padded = torch.zeros(n, padded_cols, dtype=torch.uint8, device=device)
+    padded[:, :m] = flat
+    reshaped = padded.view(n, n_bytes, 8)
+    shifts = torch.arange(8, device=device, dtype=torch.int32)
+    return (reshaped.to(torch.int32) << shifts).sum(dim=-1).to(torch.uint8)
+
+
+def unpack_bits(packed: torch.Tensor, count: int) -> torch.Tensor:
+    """Unpack uint8 bitfield into a sign tensor of +1/-1.
+
+    Args:
+        packed: Packed uint8 tensor from pack_bits.
+        count: Number of sign values to unpack.
+
+    Returns:
+        Tensor of shape (count,) with values in {-1, +1}.
+    """
+    shifts = torch.arange(8, device=packed.device, dtype=torch.uint8)
+    unpacked = ((packed.unsqueeze(-1) >> shifts) & 1).reshape(-1)[:count]
+    return unpacked.to(torch.float32) * 2.0 - 1.0
+
+
+def unpack_bits_batch(packed: torch.Tensor, count: int) -> torch.Tensor:
+    """Unpack batch packed rows (n, n_bytes) to signs (n, count), values in {-1, +1}."""
+    n = packed.shape[0]
+    device = packed.device
+    shifts = torch.arange(8, device=device, dtype=torch.uint8)
+    bits = ((packed.unsqueeze(-1) >> shifts) & 1).reshape(n, -1)[:, :count]
+    return bits.to(torch.float32) * 2.0 - 1.0
+
+
+################################################################################
+FILE: pyturboquant\core\prod_quantizer.py
+################################################################################
+
+"""Inner Product TurboQuant quantizer (Algorithm 2).
+
+Two-stage quantization: MSE quantize at (bits-1), then apply 1-bit QJL
+to the residual.  This enables unbiased inner product estimation.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from pyturboquant.core.mse_quantizer import MSEQuantizer
+from pyturboquant.core.qjl import QJLTransform
+from pyturboquant.core.types import QuantizedIP
+
+
+class InnerProductQuantizer:
+    """Two-stage inner-product-preserving quantizer.
+
+    Stage 1: MSE-optimal quantization at (bits - 1) bits.
+    Stage 2: 1-bit QJL transform on the quantization residual.
+
+    The total budget is `bits` bits per coordinate: (bits-1) for MSE + 1 for QJL.
+
+    Each ``quantize`` performs one random rotation and Lloyd--Max assignment for
+    the MSE stage, reconstructs ``x_hat`` from centroids (no pack/unpack round
+    trip for the residual), then runs QJL on the normalized residual. Cost is
+    dominated by rotation and QJL matrix multiplies; batch large ``add`` calls
+    when indexing many vectors.
+
+    Args:
+        dim: Vector dimension d.
+        bits: Total bit budget per coordinate (>= 2).
+        seed: Deterministic seed.
+        device: Torch device.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bits: int = 4,
+        seed: int = 0,
+        device: torch.device | None = None,
+    ) -> None:
+        if bits < 2:
+            raise ValueError(f"InnerProductQuantizer needs bits >= 2, got {bits}")
+        self.dim = dim
+        self.bits = bits
+        self.seed = seed
+        self.device = device or torch.device("cpu")
+        self._mse = MSEQuantizer(dim, bits=bits - 1, seed=seed, device=self.device)
+        self._qjl = QJLTransform(dim, seed=seed + 1, device=self.device)
+
+    @property
+    def mse_quantizer(self) -> MSEQuantizer:
+        return self._mse
+
+    @property
+    def qjl_transform(self) -> QJLTransform:
+        return self._qjl
+
+    def quantize(self, x: torch.Tensor) -> QuantizedIP:
+        """Quantize vectors using Algorithm 2 (Inner Product TurboQuant).
+
+        Args:
+            x: Input tensor of shape (*, d).
+
+        Returns:
+            QuantizedIP holding MSE data and QJL sign bits.
+        """
+        leading = x.shape[:-1]
+        flat = x.reshape(-1, self.dim)
+
+        mse_qt, x_hat = self._mse.quantize_with_reconstruction(flat)
+
+        residual = flat - x_hat
+        residual_norms = torch.linalg.norm(residual, dim=-1)
+        safe_norms = residual_norms.clamp(min=1e-12)
+        residual_normalized = residual / safe_norms.unsqueeze(-1)
+
+        qjl_bits = self._qjl.quantize(residual_normalized)
+
+        return QuantizedIP(
+            mse_data=mse_qt,
+            qjl_bits=qjl_bits,
+            residual_norms=residual_norms.reshape(leading),
+            dim=self.dim,
+            bits=self.bits,
+            seed=self.seed,
+            device=self.device,
+        )
+
+    def dequantize(self, qt: QuantizedIP) -> torch.Tensor:
+        """Reconstruct vectors (MSE component only; QJL is lossy).
+
+        The QJL bits only aid inner-product estimation and cannot reconstruct
+        the residual direction, so dequantize returns the MSE reconstruction.
+
+        Args:
+            qt: Quantized representation from quantize().
+
+        Returns:
+            Reconstructed tensor of shape matching the original input.
+        """
+        return self._mse.dequantize(qt.mse_data)
+
+    def dequantize_range(
+        self, qt: QuantizedIP, start: int, end: int
+    ) -> torch.Tensor:
+        """Reconstruct vectors in the index range ``[start, end)`` from a chunk.
+
+        Thin wrapper around :meth:`MSEQuantizer.dequantize_range` -- only the
+        MSE component is reconstructed. Used by ``TurboQuantIndex`` to bound
+        peak fp32 memory during search independently of chunk size.
+
+        Args:
+            qt: Quantized representation from quantize().
+            start: Inclusive start vector index.
+            end: Exclusive end vector index.
+
+        Returns:
+            Reconstructed tensor of shape ``(end - start, dim)``.
+        """
+        return self._mse.dequantize_range(qt.mse_data, start, end)
+
+    def estimate_inner_product(self, qt: QuantizedIP, y: torch.Tensor) -> torch.Tensor:
+        """Estimate <x, y> from the quantized representation.
+
+        Uses: <x, y> ≈ <x_hat_mse, y> + QJL_estimate(<r, y>)
+
+        Args:
+            qt: Quantized data for the database vectors.
+            y: Query vectors of shape (*, d).
+
+        Returns:
+            Estimated inner products, shape (*,).
+        """
+        x_hat = self._mse.dequantize(qt.mse_data)
+        flat_x_hat = x_hat.reshape(-1, self.dim)
+        flat_y = y.reshape(-1, self.dim)
+
+        mse_ip = (flat_x_hat * flat_y).sum(dim=-1)
+
+        qjl_ip = self._qjl.estimate_inner_product(
+            qt.qjl_bits.reshape(-1, qt.qjl_bits.shape[-1]),
+            flat_y,
+            qt.residual_norms.reshape(-1),
+        )
+
+        return (mse_ip + qjl_ip).reshape(qt.residual_norms.shape)
+
+
+################################################################################
+FILE: pyturboquant\core\qjl.py
+################################################################################
+
+"""Quantized Johnson-Lindenstrauss (QJL) transform (Definition 1).
+
+Projects vectors via a random Gaussian matrix and takes the sign,
+producing 1-bit sketches that allow unbiased inner product estimation.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+from pyturboquant.core.packed import pack_bits_batch, unpack_bits_batch
+
+
+class QJLTransform:
+    """1-bit Quantized Johnson-Lindenstrauss transform.
+
+    Given a random Gaussian matrix S of shape (m, d), the QJL sketch of
+    a vector r is sign(S @ r).  The inner product <x, y> can be estimated
+    unbiasedly from the sketches.
+
+    Args:
+        dim: Input dimension d.
+        m: Number of projection rows (sketch dimension). Defaults to dim.
+        seed: Deterministic seed for the projection matrix.
+        device: Torch device.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        m: int | None = None,
+        seed: int = 0,
+        device: torch.device | None = None,
+    ) -> None:
+        self.dim = dim
+        self.m = m or dim
+        self.seed = seed
+        self.device = device or torch.device("cpu")
+        self._S = self._generate()
+
+    def _generate(self) -> torch.Tensor:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(self.seed)
+        S = torch.randn(self.m, self.dim, generator=g, dtype=torch.float32)
+        return S.to(device=self.device)
+
+    @property
+    def projection_matrix(self) -> torch.Tensor:
+        return self._S
+
+    def quantize(self, r: torch.Tensor) -> torch.Tensor:
+        """Compute the QJL sketch: packed sign bits of S @ r.
+
+        Args:
+            r: Residual vectors of shape (*, d).
+
+        Returns:
+            Packed uint8 tensor of sign bits.
+        """
+        leading = r.shape[:-1]
+        flat = r.reshape(-1, self.dim)  # (n, d)
+        proj = flat @ self._S.T  # (n, m)
+        signs = (proj >= 0).to(torch.uint8)
+        packed = pack_bits_batch(signs)
+        return packed.reshape(*leading, -1)
+
+    def estimate_inner_product(
+        self,
+        packed_z: torch.Tensor,
+        y: torch.Tensor,
+        residual_norms: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimate <r, y> from the QJL sketch.
+
+        Uses the unbiased estimator:
+            <r, y>_est = sqrt(pi/2) / m * ||r|| * sum_j z_j * (S_j . y)
+
+        where z_j ∈ {-1, +1} are the unpacked sign bits.
+
+        Args:
+            packed_z: Packed sign bits from quantize(), shape (*, n_bytes).
+            y: Query vectors of shape (*, d).
+            residual_norms: L2 norms ||r||, shape (*,).
+
+        Returns:
+            Estimated inner products, shape (*,).
+        """
+        leading = packed_z.shape[:-1]
+        flat_z = packed_z.reshape(-1, packed_z.shape[-1])
+        flat_y = y.reshape(-1, self.dim)
+        flat_norms = residual_norms.reshape(-1)
+
+        Sy = flat_y @ self._S.T  # (n, m)
+        signs = unpack_bits_batch(flat_z, self.m)
+        scale = math.sqrt(math.pi / 2.0) / self.m
+        ip = (signs * Sy).sum(dim=-1)
+        return (scale * flat_norms * ip).reshape(leading)
+
+    def estimate_inner_product_batch(
+        self,
+        packed_z: torch.Tensor,
+        y: torch.Tensor,
+        residual_norms: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorized version for batch estimation (query y against n database entries).
+
+        Args:
+            packed_z: Packed sign bits, shape (n, n_bytes).
+            y: Single query vector of shape (d,).
+            residual_norms: Norms of shape (n,).
+
+        Returns:
+            Estimated inner products, shape (n,).
+        """
+        signs = unpack_bits_batch(packed_z, self.m)
+        Sy = y @ self._S.T  # (m,)
+        scale = math.sqrt(math.pi / 2.0) / self.m
+        return scale * residual_norms * (signs * Sy.unsqueeze(0)).sum(dim=-1)
+
+    def estimate_inner_product_batch_queries(
+        self,
+        packed_z: torch.Tensor,
+        queries: torch.Tensor,
+        residual_norms: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-queries variant: ``queries`` of shape (nq, d), database rows ``n``.
+
+        Returns:
+            Tensor of shape (nq, n) with ``[j, i]`` = estimate for DB row i vs query j.
+        """
+        signs = unpack_bits_batch(packed_z, self.m)  # (n, m)
+        Sy = queries @ self._S.T  # (nq, m)
+        scale = math.sqrt(math.pi / 2.0) / self.m
+        ip = signs @ Sy.T  # (n, nq)
+        return scale * residual_norms.unsqueeze(0) * ip.T
+
+
+################################################################################
+FILE: pyturboquant\core\rotation.py
+################################################################################
+
+"""Random rotation matrices for TurboQuant.
+
+Generates d x d random orthogonal matrices via QR decomposition of
+a Gaussian random matrix, ensuring uniform distribution over O(d).
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+
+import torch
+
+_MAX_ROTATION_CACHE = 64
+_ROTATION_CACHE: OrderedDict[tuple[int, int, str, str], RandomRotation] = OrderedDict()
+
+
+def _rotation_cache_key(
+    dim: int, seed: int, device: torch.device, dtype: torch.dtype
+) -> tuple[int, int, str, str]:
+    return (dim, seed, str(device), str(dtype))
+
+
+def _get_cached_rotation(
+    dim: int, seed: int, device: torch.device, dtype: torch.dtype
+) -> RandomRotation:
+    key = _rotation_cache_key(dim, seed, device, dtype)
+    if key in _ROTATION_CACHE:
+        _ROTATION_CACHE.move_to_end(key)
+        return _ROTATION_CACHE[key]
+    rot = RandomRotation(dim, seed=seed, device=device, dtype=dtype)
+    _ROTATION_CACHE[key] = rot
+    while len(_ROTATION_CACHE) > _MAX_ROTATION_CACHE:
+        _ROTATION_CACHE.popitem(last=False)
+    return rot
+
+
+class RandomRotation:
+    """Deterministic random orthogonal rotation seeded by an integer.
+
+    After rotation, each coordinate of a unit vector on S^{d-1}
+    follows a Beta distribution (Lemma 1), enabling per-coordinate
+    scalar quantization.
+
+    Args:
+        dim: Vector dimension d.
+        seed: Deterministic seed for reproducibility.
+        device: Torch device.
+        dtype: Torch dtype for the rotation matrix.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        seed: int = 0,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        self.dim = dim
+        self.seed = seed
+        self.device = device or torch.device("cpu")
+        self.dtype = dtype
+        self._matrix = self._generate()
+
+    def _generate(self) -> torch.Tensor:
+        g = torch.Generator(device="cpu")
+        g.manual_seed(self.seed)
+        gauss = torch.randn(self.dim, self.dim, generator=g, dtype=self.dtype)
+        q, r = torch.linalg.qr(gauss)
+        # Ensure uniform Haar measure by fixing the sign of the diagonal of R
+        diag_sign = torch.sign(torch.diag(r))
+        diag_sign[diag_sign == 0] = 1.0
+        q = q * diag_sign.unsqueeze(0)
+        return q.to(device=self.device)
+
+    @property
+    def matrix(self) -> torch.Tensor:
+        """The d x d orthogonal matrix Pi."""
+        return self._matrix
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply rotation: y = Pi @ x.
+
+        Args:
+            x: Tensor of shape (*, d).
+
+        Returns:
+            Rotated tensor of shape (*, d).
+        """
+        return x @ self._matrix.T
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply inverse rotation: x = Pi^T @ y.
+
+        Args:
+            y: Tensor of shape (*, d).
+
+        Returns:
+            Tensor of shape (*, d).
+        """
+        return y @ self._matrix
+
+
+def random_rotate(x: torch.Tensor, seed: int = 0) -> torch.Tensor:
+    """Functional API: apply a seeded random rotation to x.
+
+    Args:
+        x: Tensor of shape (*, d).
+        seed: Deterministic seed.
+
+    Returns:
+        Rotated tensor of shape (*, d).
+    """
+    rot = _get_cached_rotation(
+        dim=x.shape[-1], seed=seed, device=x.device, dtype=x.dtype
+    )
+    return rot.forward(x)
+
+
+def random_rotate_inverse(y: torch.Tensor, seed: int = 0) -> torch.Tensor:
+    """Functional API: apply the inverse of a seeded random rotation.
+
+    Args:
+        y: Tensor of shape (*, d).
+        seed: Must match the seed used in random_rotate.
+
+    Returns:
+        Original tensor of shape (*, d).
+    """
+    rot = _get_cached_rotation(
+        dim=y.shape[-1], seed=seed, device=y.device, dtype=y.dtype
+    )
+    return rot.inverse(y)
+
+
+################################################################################
+FILE: pyturboquant\core\types.py
+################################################################################
+
+"""Dataclass types for quantized representations."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import NamedTuple
+
+import torch
+
+
+class Codebook(NamedTuple):
+    """Precomputed Lloyd-Max codebook for a given bit-width."""
+
+    centroids: torch.Tensor  # shape (2^b,), sorted ascending
+    boundaries: torch.Tensor  # shape (2^b - 1,), midpoints between centroids
+    bits: int
+    mse_cost: float  # optimal MSE per coordinate for this codebook
+
+
+@dataclass
+class QuantizedMSE:
+    """Quantized representation from TurboQuant_mse (Algorithm 1)."""
+
+    packed_indices: torch.Tensor  # bit-packed centroid indices
+    norms: torch.Tensor  # original L2 norms, shape (*, 1) or scalar
+    dim: int
+    bits: int
+    seed: int
+    device: torch.device
+
+
+@dataclass
+class QuantizedIP:
+    """Quantized representation from TurboQuant_prod (Algorithm 2)."""
+
+    mse_data: QuantizedMSE  # MSE quantization at (bits - 1)
+    qjl_bits: torch.Tensor  # packed sign bits from QJL, shape (*, d_packed)
+    residual_norms: torch.Tensor  # ||r||_2, shape (*,)
+    dim: int
+    bits: int
+    seed: int
+    device: torch.device
+
+
+################################################################################
+FILE: pyturboquant\core\__init__.py
+################################################################################
+
+"""pyturboquant.core -- Pure PyTorch building blocks for TurboQuant quantization.
+
+Public API re-exports and convenience functional wrappers.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from pyturboquant.core.mse_quantizer import MSEQuantizer
+from pyturboquant.core.prod_quantizer import InnerProductQuantizer
+from pyturboquant.core.qjl import QJLTransform
+from pyturboquant.core.rotation import RandomRotation, random_rotate, random_rotate_inverse
+from pyturboquant.core.types import Codebook, QuantizedIP, QuantizedMSE
+
+__all__ = [
+    "Codebook",
+    "InnerProductQuantizer",
+    "MSEQuantizer",
+    "QJLTransform",
+    "QuantizedIP",
+    "QuantizedMSE",
+    "RandomRotation",
+    "estimate_inner_product",
+    "ip_dequantize",
+    "ip_quantize",
+    "mse_dequantize",
+    "mse_quantize",
+    "random_rotate",
+    "random_rotate_inverse",
+]
+
+_MSE_CACHE: dict[tuple[int, int, int, str], MSEQuantizer] = {}
+_IP_CACHE: dict[tuple[int, int, int, str], InnerProductQuantizer] = {}
+
+
+def _get_mse(dim: int, bits: int, seed: int, device: torch.device) -> MSEQuantizer:
+    key = (dim, bits, seed, str(device))
+    if key not in _MSE_CACHE:
+        _MSE_CACHE[key] = MSEQuantizer(dim, bits, seed, device)
+    return _MSE_CACHE[key]
+
+
+def _get_ip(dim: int, bits: int, seed: int, device: torch.device) -> InnerProductQuantizer:
+    key = (dim, bits, seed, str(device))
+    if key not in _IP_CACHE:
+        _IP_CACHE[key] = InnerProductQuantizer(dim, bits, seed, device)
+    return _IP_CACHE[key]
+
+
+def mse_quantize(
+    x: torch.Tensor, bits: int = 4, seed: int = 0
+) -> QuantizedMSE:
+    """Functional API: MSE-optimal quantization (Algorithm 1).
+
+    Args:
+        x: Input tensor of shape (*, d).
+        bits: Bit-width (1-8).
+        seed: Deterministic seed.
+
+    Returns:
+        QuantizedMSE representation.
+    """
+    q = _get_mse(x.shape[-1], bits, seed, x.device)
+    return q.quantize(x)
+
+
+def mse_dequantize(qt: QuantizedMSE) -> torch.Tensor:
+    """Functional API: reconstruct from MSE-quantized representation.
+
+    Args:
+        qt: QuantizedMSE from mse_quantize().
+
+    Returns:
+        Reconstructed tensor.
+    """
+    q = _get_mse(qt.dim, qt.bits, qt.seed, qt.device)
+    return q.dequantize(qt)
+
+
+def ip_quantize(
+    x: torch.Tensor, bits: int = 4, seed: int = 0
+) -> QuantizedIP:
+    """Functional API: inner-product-preserving quantization (Algorithm 2).
+
+    Args:
+        x: Input tensor of shape (*, d).
+        bits: Total bit budget (>= 2).
+        seed: Deterministic seed.
+
+    Returns:
+        QuantizedIP representation.
+    """
+    q = _get_ip(x.shape[-1], bits, seed, x.device)
+    return q.quantize(x)
+
+
+def ip_dequantize(qt: QuantizedIP) -> torch.Tensor:
+    """Functional API: reconstruct from IP-quantized representation (MSE component).
+
+    Args:
+        qt: QuantizedIP from ip_quantize().
+
+    Returns:
+        Reconstructed tensor.
+    """
+    q = _get_ip(qt.dim, qt.bits, qt.seed, qt.device)
+    return q.dequantize(qt)
+
+
+def estimate_inner_product(qt: QuantizedIP, y: torch.Tensor) -> torch.Tensor:
+    """Functional API: estimate <x, y> from quantized representation.
+
+    Args:
+        qt: QuantizedIP from ip_quantize().
+        y: Query vectors of shape (*, d).
+
+    Returns:
+        Estimated inner products.
+    """
+    q = _get_ip(qt.dim, qt.bits, qt.seed, qt.device)
+    return q.estimate_inner_product(qt, y)
+
+
+################################################################################
+FILE: pyturboquant\utils\beta_distribution.py
+################################################################################
+
+"""Beta distribution of coordinates on the unit hypersphere (Lemma 1 of TurboQuant paper).
+
+For a random point uniformly distributed on S^{d-1}, each coordinate follows:
+    f_X(x) = Gamma(d/2) / (sqrt(pi) * Gamma((d-1)/2)) * (1 - x^2)^((d-3)/2)
+which converges to N(0, 1/d) as d -> infinity.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+
+
+def sphere_coordinate_pdf(x: torch.Tensor, d: int) -> torch.Tensor:
+    """Evaluate the PDF of a single coordinate of a uniform random point on S^{d-1}.
+
+    Args:
+        x: Points in [-1, 1] at which to evaluate the PDF.
+        d: Ambient dimension (must be >= 3).
+
+    Returns:
+        PDF values, same shape as x.
+    """
+    if d < 3:
+        raise ValueError(f"Dimension must be >= 3, got {d}")
+    log_norm = (
+        math.lgamma(d / 2) - 0.5 * math.log(math.pi) - math.lgamma((d - 1) / 2)
+    )
+    exponent = (d - 3) / 2
+    log_body = exponent * torch.log1p(-x * x)
+    return torch.exp(log_norm + log_body)
+
+
+def sphere_coordinate_pdf_numpy(x: float, d: int) -> float:
+    """Scalar version for scipy integration during codebook precomputation."""
+    if abs(x) >= 1.0:
+        return 0.0
+    log_norm = (
+        math.lgamma(d / 2) - 0.5 * math.log(math.pi) - math.lgamma((d - 1) / 2)
+    )
+    exponent = (d - 3) / 2
+    log_body = exponent * math.log(1.0 - x * x)
+    return math.exp(log_norm + log_body)
+
+
+def sphere_coordinate_variance(d: int) -> float:
+    """Variance of a single coordinate on S^{d-1}, equals 1/d."""
+    return 1.0 / d
+
+
+def gaussian_pdf(x: torch.Tensor, variance: float = 1.0) -> torch.Tensor:
+    """Standard Gaussian PDF N(0, variance)."""
+    return torch.exp(-x * x / (2 * variance)) / math.sqrt(2 * math.pi * variance)
+
+
+def gaussian_pdf_numpy(x: float, variance: float = 1.0) -> float:
+    """Scalar Gaussian PDF for scipy integration."""
+    return math.exp(-x * x / (2 * variance)) / math.sqrt(2 * math.pi * variance)
+
+
+################################################################################
+FILE: pyturboquant\utils\metrics.py
+################################################################################
+
+"""Distortion and quality metrics for quantizer evaluation."""
+
+from __future__ import annotations
+
+import torch
+
+
+def mse_distortion(x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
+    """Mean squared error between original and reconstructed vectors.
+
+    Computes: mean(||x_i - x_hat_i||^2 / ||x_i||^2) over the batch,
+    i.e. the normalized MSE distortion as defined in the paper.
+
+    Args:
+        x: Original vectors of shape (n, d).
+        x_hat: Reconstructed vectors of shape (n, d).
+
+    Returns:
+        Scalar tensor with the mean normalized MSE distortion.
+    """
+    sq_err = ((x - x_hat) ** 2).sum(dim=-1)
+    sq_norm = (x**2).sum(dim=-1).clamp(min=1e-12)
+    return (sq_err / sq_norm).mean()
+
+
+def inner_product_error(
+    x: torch.Tensor, y: torch.Tensor, x_hat: torch.Tensor
+) -> torch.Tensor:
+    """Mean absolute error of inner product estimation.
+
+    Computes: mean(|<x_i, y_i> - <x_hat_i, y_i>|) over the batch.
+
+    Args:
+        x: Original vectors of shape (n, d).
+        y: Query vectors of shape (n, d).
+        x_hat: Reconstructed vectors of shape (n, d).
+
+    Returns:
+        Scalar tensor with the mean absolute inner-product error.
+    """
+    true_ip = (x * y).sum(dim=-1)
+    est_ip = (x_hat * y).sum(dim=-1)
+    return (true_ip - est_ip).abs().mean()
+
+
+def shannon_lower_bound(bits: int) -> float:
+    """Shannon rate-distortion lower bound: D >= 1/4^b per coordinate.
+
+    For d-dimensional vectors, the total normalized MSE lower bound is 1/(d * 4^b).
+    This function returns the per-coordinate value 1/4^b.
+
+    Args:
+        bits: Bit-width b.
+
+    Returns:
+        Lower bound on MSE per coordinate.
+    """
+    return 1.0 / (4**bits)
+
+
+################################################################################
+FILE: pyturboquant\utils\__init__.py
+################################################################################
+
+"""pyturboquant.utils -- Utility modules."""
+
+
+################################################################################
+FILE: pyturboquant\search\distance.py
+################################################################################
+
+"""Asymmetric distance computations for quantized vector search.
+
+The query is kept in full precision while database vectors are quantized,
+enabling fast approximate distance computation.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from pyturboquant.core.mse_quantizer import MSEQuantizer
+from pyturboquant.core.qjl import QJLTransform
+from pyturboquant.core.types import QuantizedIP
+
+
+def asymmetric_inner_product(
+    query: torch.Tensor,
+    qt_list: list[QuantizedIP],
+    mse_quantizer: MSEQuantizer,
+    qjl_transform: QJLTransform,
+) -> torch.Tensor:
+    """Compute asymmetric inner products between a query and quantized database.
+
+    <x_i, q> ≈ <x_hat_mse_i, q> + QJL_estimate(<r_i, q>)
+
+    Args:
+        query: Query vector of shape (d,).
+        qt_list: List of QuantizedIP entries (one per database vector or batch).
+        mse_quantizer: The MSEQuantizer used for the database.
+        qjl_transform: The QJLTransform used for the database.
+
+    Returns:
+        Inner product estimates, shape (n,).
+    """
+    scores = []
+    for qt in qt_list:
+        x_hat = mse_quantizer.dequantize(qt.mse_data)
+        flat_x_hat = x_hat.reshape(-1, query.shape[-1])
+        mse_ip = (flat_x_hat * query.unsqueeze(0)).sum(dim=-1)
+
+        qjl_ip = qjl_transform.estimate_inner_product_batch(
+            qt.qjl_bits.reshape(-1, qt.qjl_bits.shape[-1]),
+            query,
+            qt.residual_norms.reshape(-1),
+        )
+        scores.append(mse_ip + qjl_ip)
+    return torch.cat(scores)
+
+
+def asymmetric_l2(
+    query: torch.Tensor,
+    qt_list: list[QuantizedIP],
+    mse_quantizer: MSEQuantizer,
+    qjl_transform: QJLTransform,
+    norms_sq: torch.Tensor,
+) -> torch.Tensor:
+    """Compute asymmetric squared L2 distances using the identity:
+    ||x - q||^2 = ||x||^2 - 2<x, q> + ||q||^2
+
+    Uses the same asymmetric inner-product estimate (MSE + QJL) as
+    :class:`TurboQuantIndex` with ``metric="l2"``.
+
+    Args:
+        query: Query vector of shape (d,).
+        qt_list: List of QuantizedIP entries.
+        mse_quantizer: MSEQuantizer for the database.
+        qjl_transform: QJL transform used when building ``qt_list``.
+        norms_sq: Precomputed ||x_i||^2 for each database vector, shape (n,).
+
+    Returns:
+        Approximate squared L2 distances, shape (n,).
+    """
+    ip = asymmetric_inner_product(query, qt_list, mse_quantizer, qjl_transform)
+    q_norm_sq = (query * query).sum()
+    return norms_sq - 2.0 * ip + q_norm_sq
+
+
+################################################################################
+FILE: pyturboquant\search\index.py
+################################################################################
+
+"""TurboQuantIndex -- FAISS-inspired nearest neighbor search engine.
+
+Quantizes database vectors using InnerProductQuantizer and performs
+asymmetric search against full-precision queries.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import torch
+
+from pyturboquant.core.prod_quantizer import InnerProductQuantizer
+from pyturboquant.core.types import QuantizedIP, QuantizedMSE
+
+
+class TurboQuantIndex:
+    """GPU-accelerated approximate nearest neighbor index using TurboQuant.
+
+    Quantizes database vectors with InnerProductQuantizer (Algorithm 2)
+    and searches via asymmetric inner product / L2 computation.
+
+    Args:
+        dim: Vector dimension.
+        bits: Total bit budget per coordinate (>= 2).
+        metric: Distance metric, one of "ip" (inner product) or "l2".
+        seed: Deterministic seed for quantization.
+        device: Torch device.
+        search_batch_size: Maximum number of database vectors whose fp32
+            reconstruction is materialized at once during ``search``. Peak
+            transient memory during search is bounded by
+            ``search_batch_size * dim * 4`` bytes regardless of index size,
+            so a consolidated 10 M vector index no longer needs tens of GB
+            of scratch RAM. Tune lower for tight memory budgets, higher for
+            maximum throughput.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bits: int = 4,
+        metric: str = "ip",
+        seed: int = 0,
+        device: str | torch.device = "cpu",
+        search_batch_size: int = 65_536,
+    ) -> None:
+        if metric not in ("ip", "l2"):
+            raise ValueError(f"metric must be 'ip' or 'l2', got {metric!r}")
+        if search_batch_size < 1:
+            raise ValueError(
+                f"search_batch_size must be >= 1, got {search_batch_size}"
+            )
+        self.dim = dim
+        self.bits = bits
+        self.metric = metric
+        self.seed = seed
+        self.device = torch.device(device) if isinstance(device, str) else device
+        self.search_batch_size = search_batch_size
+        self._quantizer = InnerProductQuantizer(
+            dim=dim, bits=bits, seed=seed, device=self.device
+        )
+        self._qt_data: list[QuantizedIP] = []
+        self._norms_sq: list[torch.Tensor] = []
+        self._ntotal = 0
+        self._last_add_time_ms: float = 0.0
+
+    @property
+    def ntotal(self) -> int:
+        """Total number of indexed vectors."""
+        return self._ntotal
+
+    @property
+    def nchunks(self) -> int:
+        """Number of internal chunks produced by repeated ``add`` calls.
+
+        Useful for deciding when to call :meth:`consolidate`.
+        """
+        return len(self._qt_data)
+
+    @property
+    def last_add_time_ms(self) -> float:
+        """Wall-clock time of the last add() call in milliseconds."""
+        return self._last_add_time_ms
+
+    @property
+    def memory_usage_mb(self) -> float:
+        """Approximate memory usage of the quantized index in MB."""
+        total_bytes = 0
+        for qt in self._qt_data:
+            for t in (
+                qt.mse_data.packed_indices,
+                qt.mse_data.norms,
+                qt.qjl_bits,
+                qt.residual_norms,
+            ):
+                total_bytes += t.numel() * t.element_size()
+        return total_bytes / (1024 * 1024)
+
+    def add(self, vectors: torch.Tensor) -> None:
+        """Add vectors to the index.
+
+        Args:
+            vectors: Tensor of shape (n, d) to index.
+        """
+        if vectors.shape[-1] != self.dim:
+            raise ValueError(f"Expected dim={self.dim}, got {vectors.shape[-1]}")
+
+        t0 = time.perf_counter()
+        vectors = vectors.to(self.device)
+        qt = self._quantizer.quantize(vectors)
+        self._qt_data.append(qt)
+        norms_sq = (vectors * vectors).sum(dim=-1)
+        self._norms_sq.append(norms_sq)
+        self._ntotal += vectors.shape[0]
+        self._last_add_time_ms = (time.perf_counter() - t0) * 1000.0
+
+    def consolidate(self) -> None:
+        """Merge all index chunks from repeated ``add`` into a single chunk.
+
+        Reduces Python-loop overhead during ``search`` when many small batches
+        were added. Peak transient memory during ``search`` is bounded by
+        ``search_batch_size`` regardless of whether this method is called, so
+        consolidating a very large index is safe. No-op if there is at most
+        one chunk.
+        """
+        if len(self._qt_data) <= 1:
+            return
+
+        first = self._qt_data[0]
+        mse_packed = torch.cat([q.mse_data.packed_indices for q in self._qt_data], dim=0)
+        mse_norms = torch.cat(
+            [q.mse_data.norms.reshape(-1, 1) for q in self._qt_data], dim=0
+        )
+        qjl_bits = torch.cat(
+            [q.qjl_bits.reshape(q.qjl_bits.shape[0], -1) for q in self._qt_data], dim=0
+        )
+        residual_norms = torch.cat(
+            [q.residual_norms.reshape(-1) for q in self._qt_data], dim=0
+        )
+
+        mse_merged = QuantizedMSE(
+            packed_indices=mse_packed,
+            norms=mse_norms,
+            dim=first.mse_data.dim,
+            bits=first.mse_data.bits,
+            seed=first.mse_data.seed,
+            device=self.device,
+        )
+        merged = QuantizedIP(
+            mse_data=mse_merged,
+            qjl_bits=qjl_bits,
+            residual_norms=residual_norms,
+            dim=first.dim,
+            bits=first.bits,
+            seed=first.seed,
+            device=self.device,
+        )
+        self._qt_data = [merged]
+        self._norms_sq = [torch.cat(self._norms_sq, dim=0)]
+
+    def search(
+        self, queries: torch.Tensor, k: int = 10
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Search the index for nearest neighbors.
+
+        Args:
+            queries: Query vectors of shape (nq, d) or (d,).
+            k: Number of neighbors to return.
+
+        Returns:
+            Tuple of (distances, indices) each of shape (nq, k).
+            For metric="ip", distances are inner products (higher is better).
+            For metric="l2", distances are squared L2 (lower is better).
+        """
+        if self._ntotal == 0:
+            raise RuntimeError("Index is empty. Call add() first.")
+
+        single = queries.dim() == 1
+        if single:
+            queries = queries.unsqueeze(0)
+        queries = queries.to(self.device)
+
+        k = min(k, self._ntotal)
+        scores = self._compute_scores_batch(queries)
+
+        if self.metric == "ip":
+            topk_vals, topk_idx = torch.topk(scores, k, dim=-1, largest=True)
+        else:
+            topk_vals, topk_idx = torch.topk(scores, k, dim=-1, largest=False)
+
+        if single:
+            topk_vals = topk_vals.squeeze(0)
+            topk_idx = topk_idx.squeeze(0)
+
+        return topk_vals, topk_idx
+
+    def _compute_scores_batch(self, queries: torch.Tensor) -> torch.Tensor:
+        """Scores for each query vs all DB vectors. Shape (nq, n_total).
+
+        Sub-iterates each stored chunk in ``search_batch_size``-sized windows
+        so peak fp32 reconstruction memory is ``search_batch_size * dim * 4``
+        bytes, independent of total index size.
+        """
+        q_norm_sq = (queries * queries).sum(dim=-1, keepdim=True)  # (nq, 1)
+        cols: list[torch.Tensor] = []
+        for i, qt in enumerate(self._qt_data):
+            chunk_ip = self._score_chunk(qt, queries)  # (nq, n_chunk)
+            if self.metric == "ip":
+                cols.append(chunk_ip)
+            else:
+                ns = self._norms_sq[i].reshape(1, -1)
+                cols.append(ns - 2.0 * chunk_ip + q_norm_sq)
+        return torch.cat(cols, dim=-1)
+
+    def _score_chunk(
+        self, qt: QuantizedIP, queries: torch.Tensor
+    ) -> torch.Tensor:
+        """Inner-product scores between ``queries`` and a single chunk.
+
+        Walks the chunk in sub-batches of up to ``search_batch_size`` vectors,
+        reconstructing and discarding the fp32 window for each sub-batch so
+        that peak transient memory does not scale with chunk size.
+
+        Returns:
+            Tensor of shape ``(nq, n_chunk)``.
+        """
+        nq = queries.shape[0]
+        n_chunk = qt.residual_norms.reshape(-1).shape[0]
+        batch = max(1, self.search_batch_size)
+        qjl_flat = qt.qjl_bits.reshape(n_chunk, -1)
+        res_norms = qt.residual_norms.reshape(-1)
+
+        out = torch.empty(
+            nq, n_chunk, dtype=queries.dtype, device=queries.device
+        )
+        for start in range(0, n_chunk, batch):
+            end = min(start + batch, n_chunk)
+            x_hat_sub = self._quantizer.dequantize_range(qt, start, end)
+            mse_ip_sub = x_hat_sub @ queries.T  # (m, nq)
+            qjl_ip_sub = (
+                self._quantizer.qjl_transform
+                .estimate_inner_product_batch_queries(
+                    qjl_flat[start:end],
+                    queries,
+                    res_norms[start:end],
+                )
+            )  # (nq, m)
+            out[:, start:end] = mse_ip_sub.T + qjl_ip_sub
+        return out
+
+    def save(self, path: str | Path) -> None:
+        """Save index state to disk.
+
+        Args:
+            path: File path for the saved index.
+        """
+        path = Path(path)
+        state = {
+            "dim": self.dim,
+            "bits": self.bits,
+            "metric": self.metric,
+            "seed": self.seed,
+            "ntotal": self._ntotal,
+            "qt_data": [
+                {
+                    "mse_packed": qt.mse_data.packed_indices.cpu(),
+                    "mse_norms": qt.mse_data.norms.cpu(),
+                    "mse_dim": qt.mse_data.dim,
+                    "mse_bits": qt.mse_data.bits,
+                    "mse_seed": qt.mse_data.seed,
+                    "qjl_bits": qt.qjl_bits.cpu(),
+                    "residual_norms": qt.residual_norms.cpu(),
+                }
+                for qt in self._qt_data
+            ],
+            "norms_sq": [ns.cpu() for ns in self._norms_sq],
+        }
+        torch.save(state, path)
+
+    @classmethod
+    def load(
+        cls, path: str | Path, device: str | torch.device = "cpu"
+    ) -> TurboQuantIndex:
+        """Load a saved index.
+
+        Args:
+            path: File path to load from.
+            device: Device to load tensors to.
+
+        Returns:
+            Loaded TurboQuantIndex.
+        """
+        state = torch.load(Path(path), weights_only=True, map_location=device)
+        dev = torch.device(device) if isinstance(device, str) else device
+
+        index = cls(
+            dim=state["dim"],
+            bits=state["bits"],
+            metric=state["metric"],
+            seed=state["seed"],
+            device=dev,
+        )
+
+        for qt_dict, ns in zip(state["qt_data"], state["norms_sq"], strict=True):
+            mse_data = QuantizedMSE(
+                packed_indices=qt_dict["mse_packed"].to(dev),
+                norms=qt_dict["mse_norms"].to(dev),
+                dim=qt_dict["mse_dim"],
+                bits=qt_dict["mse_bits"],
+                seed=qt_dict["mse_seed"],
+                device=dev,
+            )
+            qt = QuantizedIP(
+                mse_data=mse_data,
+                qjl_bits=qt_dict["qjl_bits"].to(dev),
+                residual_norms=qt_dict["residual_norms"].to(dev),
+                dim=state["dim"],
+                bits=state["bits"],
+                seed=state["seed"],
+                device=dev,
+            )
+            index._qt_data.append(qt)
+            index._norms_sq.append(ns.to(dev))
+
+        index._ntotal = state["ntotal"]
+        return index
+
+
+################################################################################
+FILE: pyturboquant\search\langchain.py
+################################################################################
+
+"""LangChain VectorStore integration for TurboQuant NN search.
+
+Provides TurboQuantVectorStore, a LangChain-compatible vector store backed
+by TurboQuantIndex for low-RAM, high-speed RAG pipelines.
+
+Install with: pip install pyturboquant[langchain]
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+try:
+    from langchain_core.documents import Document
+    from langchain_core.embeddings import Embeddings
+    from langchain_core.vectorstores import VectorStore
+except ImportError as e:
+    raise ImportError(
+        "LangChain dependencies not found. "
+        "Install with: pip install pyturboquant[langchain]"
+    ) from e
+
+import torch
+
+from pyturboquant.search.index import TurboQuantIndex
+
+_AUTO_CONSOLIDATE_THRESHOLD = 16
+"""When the underlying index has more than this many pending chunks, a
+store-level search triggers :meth:`TurboQuantIndex.consolidate` to amortize
+Python-loop overhead from streaming ingestion.
+"""
+
+
+class TurboQuantVectorStore(VectorStore):
+    """LangChain VectorStore backed by a TurboQuantIndex.
+
+    Wraps the TurboQuant NN search engine to provide a standard LangChain
+    interface for building RAG pipelines with extreme memory efficiency.
+
+    Args:
+        embedding: LangChain Embeddings model for text -> vector.
+        dim: Optional vector dimension. If provided, the underlying index is
+            created eagerly so that ``add_texts`` can run without first inferring
+            the dimension from an embedding batch.
+        bits: Quantization bit-width (>= 2).
+        metric: Distance metric ("ip" or "l2").
+        seed: Deterministic seed for quantization.
+        device: Torch device.
+    """
+
+    def __init__(
+        self,
+        embedding: Embeddings,
+        *,
+        dim: int | None = None,
+        bits: int = 4,
+        metric: str = "ip",
+        seed: int = 0,
+        device: str | torch.device = "cpu",
+    ) -> None:
+        self._embedding = embedding
+        self._bits = bits
+        self._metric = metric
+        self._seed = seed
+        self._device = torch.device(device) if isinstance(device, str) else device
+        self._dim = dim
+        self._index: TurboQuantIndex | None = None
+        if dim is not None:
+            self._index = TurboQuantIndex(
+                dim=dim,
+                bits=bits,
+                metric=metric,
+                seed=seed,
+                device=self._device,
+            )
+        self._documents: list[Document] = []
+        self._ids: list[str] = []
+        self._id_to_pos: dict[str, int] = {}
+        self._tombstones: set[int] = set()
+
+    @property
+    def embeddings(self) -> Embeddings:
+        """Access the embedding model."""
+        return self._embedding
+
+    def _ensure_index(self, dim: int) -> TurboQuantIndex:
+        if self._index is None:
+            self._dim = dim
+            self._index = TurboQuantIndex(
+                dim=dim,
+                bits=self._bits,
+                metric=self._metric,
+                seed=self._seed,
+                device=self._device,
+            )
+        return self._index
+
+    def _maybe_consolidate(self) -> None:
+        if (
+            self._index is not None
+            and self._index.nchunks > _AUTO_CONSOLIDATE_THRESHOLD
+        ):
+            self._index.consolidate()
+
+    def consolidate(self) -> None:
+        """Force consolidation of any pending index chunks.
+
+        Useful after heavy streaming ingestion; normally the store consolidates
+        automatically on search when enough chunks have accumulated.
+        """
+        if self._index is not None:
+            self._index.consolidate()
+
+    def add_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: list[dict[str, Any]] | None = None,
+        *,
+        ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        """Embed texts and add them to the index.
+
+        Args:
+            texts: Iterable of text strings to add.
+            metadatas: Optional metadata dicts for each text.
+            ids: Optional IDs for each text (keyword-only, matching the base
+                ``VectorStore`` signature).
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            List of IDs for the added texts.
+        """
+        text_list = list(texts)
+        if not text_list:
+            return []
+
+        if ids is not None and len(ids) != len(text_list):
+            raise ValueError(
+                f"ids length ({len(ids)}) does not match texts length ({len(text_list)})"
+            )
+
+        vectors = self._embedding.embed_documents(text_list)
+        embeddings_tensor = torch.tensor(vectors, dtype=torch.float32, device=self._device)
+        idx = self._ensure_index(embeddings_tensor.shape[-1])
+        idx.add(embeddings_tensor)
+
+        result_ids = list(ids) if ids is not None else [str(uuid.uuid4()) for _ in text_list]
+        if metadatas is None:
+            metadatas = [{} for _ in text_list]
+
+        start = len(self._documents)
+        for i, (text, meta, doc_id) in enumerate(
+            zip(text_list, metadatas, result_ids, strict=True)
+        ):
+            pos = start + i
+            self._documents.append(Document(page_content=text, metadata=meta))
+            self._ids.append(doc_id)
+            self._id_to_pos[doc_id] = pos
+
+        return result_ids
+
+    def delete(self, ids: list[str] | None = None, **kwargs: Any) -> bool | None:
+        """Soft-delete documents by id.
+
+        The underlying :class:`TurboQuantIndex` is append-only, so deleted
+        positions are tombstoned and filtered out at search time. ``add_texts``
+        followed by ``delete`` does not reclaim memory; call ``consolidate`` if
+        you need to normalize chunk layout afterwards.
+
+        Args:
+            ids: IDs to remove. If ``None``, all documents are deleted.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            ``True`` if every requested id was present; ``False`` if any id was
+            unknown. When ``ids`` is ``None``, always ``True``.
+        """
+        if ids is None:
+            self._tombstones = set(range(len(self._documents)))
+            return True
+        all_found = True
+        for doc_id in ids:
+            pos = self._id_to_pos.get(doc_id)
+            if pos is None:
+                all_found = False
+                continue
+            self._tombstones.add(pos)
+        return all_found
+
+    def get_by_ids(self, ids: Iterable[str]) -> list[Document]:
+        """Return documents matching the given ids, preserving order.
+
+        Unknown or tombstoned ids are silently skipped.
+        """
+        out: list[Document] = []
+        for doc_id in ids:
+            pos = self._id_to_pos.get(doc_id)
+            if pos is None or pos in self._tombstones:
+                continue
+            out.append(self._documents[pos])
+        return out
+
+    def similarity_search(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> list[Document]:
+        """Search for documents similar to the query.
+
+        Args:
+            query: Query text.
+            k: Number of results.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            List of Documents ranked by similarity.
+        """
+        docs_and_scores = self.similarity_search_with_score(query, k=k)
+        return [doc for doc, _ in docs_and_scores]
+
+    def similarity_search_with_score(
+        self, query: str, k: int = 4, **kwargs: Any
+    ) -> list[tuple[Document, float]]:
+        """Search with similarity scores.
+
+        Args:
+            query: Query text.
+            k: Number of results.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            List of (Document, score) tuples. For IP metric, higher is better.
+        """
+        if self._index is None or self._index.ntotal == 0:
+            return []
+
+        query_vec = self._embedding.embed_query(query)
+        return self.similarity_search_by_vector_with_score(query_vec, k=k)
+
+    def similarity_search_by_vector(
+        self,
+        embedding: list[float] | torch.Tensor,
+        k: int = 4,
+        **kwargs: Any,
+    ) -> list[Document]:
+        """Search by a single pre-computed embedding vector.
+
+        Matches the base ``VectorStore`` contract: input is a single query and
+        output is a flat list of Documents. Use :meth:`similarity_search_by_vectors`
+        to search a batch of queries.
+
+        Args:
+            embedding: Query embedding of shape ``(d,)`` or ``(1, d)``, either as
+                a ``list[float]`` or a ``torch.Tensor``.
+            k: Number of results.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            Documents ranked by similarity.
+        """
+        results = self.similarity_search_by_vector_with_score(embedding, k=k)
+        return [doc for doc, _ in results]
+
+    def similarity_search_by_vector_with_score(
+        self,
+        embedding: list[float] | torch.Tensor,
+        k: int = 4,
+        **kwargs: Any,
+    ) -> list[tuple[Document, float]]:
+        """Single-query vector search with scores.
+
+        Args:
+            embedding: Query embedding of shape ``(d,)`` or ``(1, d)``.
+            k: Number of results.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            Flat list of up to ``k`` ``(Document, score)`` pairs.
+
+        Raises:
+            ValueError: If a 2-D tensor with more than one row is passed; use
+                :meth:`similarity_search_by_vectors_with_score` for batch search.
+        """
+        if self._index is None or self._index.ntotal == 0:
+            return []
+
+        tensor = self._coerce_embedding(embedding)
+        if tensor.dim() > 1:
+            if tensor.shape[0] != 1:
+                raise ValueError(
+                    "similarity_search_by_vector_with_score expects a single query "
+                    f"(got shape {tuple(tensor.shape)}); "
+                    "use similarity_search_by_vectors_with_score for batch search"
+                )
+            tensor = tensor.squeeze(0)
+
+        self._maybe_consolidate()
+        return self._search_single(tensor, k)
+
+    def similarity_search_by_vectors(
+        self,
+        embeddings: list[list[float]] | torch.Tensor,
+        k: int = 4,
+        **kwargs: Any,
+    ) -> list[list[Document]]:
+        """Batch variant of :meth:`similarity_search_by_vector`.
+
+        Args:
+            embeddings: Query embeddings of shape ``(nq, d)``.
+            k: Number of results per query.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            List of length ``nq``; each entry a list of up to ``k`` Documents.
+        """
+        scored = self.similarity_search_by_vectors_with_score(embeddings, k=k)
+        return [[doc for doc, _ in row] for row in scored]
+
+    def similarity_search_by_vectors_with_score(
+        self,
+        embeddings: list[list[float]] | torch.Tensor,
+        k: int = 4,
+        **kwargs: Any,
+    ) -> list[list[tuple[Document, float]]]:
+        """Batch variant of :meth:`similarity_search_by_vector_with_score`.
+
+        Args:
+            embeddings: Query embeddings of shape ``(nq, d)``. A 1-D tensor is
+                treated as a batch of size 1.
+            k: Number of results per query.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            List of length ``nq``; each entry a list of up to ``k``
+            ``(Document, score)`` pairs.
+        """
+        if self._index is None or self._index.ntotal == 0:
+            return []
+
+        tensor = self._coerce_embedding(embeddings)
+        if tensor.dim() == 1:
+            tensor = tensor.unsqueeze(0)
+
+        self._maybe_consolidate()
+        return self._search_batch(tensor, k)
+
+    def _coerce_embedding(
+        self, embedding: list[float] | list[list[float]] | torch.Tensor
+    ) -> torch.Tensor:
+        if isinstance(embedding, torch.Tensor):
+            tensor = embedding
+        else:
+            tensor = torch.tensor(embedding, dtype=torch.float32)
+        return tensor.to(device=self._device, dtype=torch.float32)
+
+    def _search_single(
+        self, query: torch.Tensor, k: int
+    ) -> list[tuple[Document, float]]:
+        assert self._index is not None
+        effective_k = min(k + len(self._tombstones), self._index.ntotal)
+        distances, indices = self._index.search(query, k=effective_k)
+        out: list[tuple[Document, float]] = []
+        for rank in range(indices.shape[0]):
+            if len(out) >= k:
+                break
+            doc_idx = int(indices[rank].item())
+            if doc_idx in self._tombstones:
+                continue
+            if 0 <= doc_idx < len(self._documents):
+                out.append((self._documents[doc_idx], float(distances[rank].item())))
+        return out
+
+    def _search_batch(
+        self, queries: torch.Tensor, k: int
+    ) -> list[list[tuple[Document, float]]]:
+        assert self._index is not None
+        effective_k = min(k + len(self._tombstones), self._index.ntotal)
+        distances, indices = self._index.search(queries, k=effective_k)
+        out: list[list[tuple[Document, float]]] = []
+        for qi in range(indices.shape[0]):
+            row: list[tuple[Document, float]] = []
+            for rank in range(indices.shape[1]):
+                if len(row) >= k:
+                    break
+                doc_idx = int(indices[qi, rank].item())
+                if doc_idx in self._tombstones:
+                    continue
+                if 0 <= doc_idx < len(self._documents):
+                    row.append(
+                        (self._documents[doc_idx], float(distances[qi, rank].item()))
+                    )
+            out.append(row)
+        return out
+
+    @classmethod
+    def from_texts(
+        cls,
+        texts: list[str],
+        embedding: Embeddings,
+        metadatas: list[dict[str, Any]] | None = None,
+        *,
+        ids: list[str] | None = None,
+        bits: int = 4,
+        metric: str = "ip",
+        seed: int = 0,
+        device: str | torch.device = "cpu",
+        **kwargs: Any,
+    ) -> TurboQuantVectorStore:
+        """Create a TurboQuantVectorStore from a list of texts.
+
+        Args:
+            texts: List of text strings.
+            embedding: LangChain Embeddings model.
+            metadatas: Optional metadata for each text.
+            ids: Optional IDs for each text (keyword-only).
+            bits: Quantization bit-width.
+            metric: Distance metric.
+            seed: Deterministic seed.
+            device: Torch device.
+            **kwargs: Additional keyword arguments (ignored).
+
+        Returns:
+            Initialized and populated TurboQuantVectorStore.
+        """
+        store = cls(
+            embedding=embedding,
+            bits=bits,
+            metric=metric,
+            seed=seed,
+            device=device,
+        )
+        store.add_texts(texts, metadatas=metadatas, ids=ids)
+        return store
+
+    def save(self, path: str | Path) -> None:
+        """Save the vector store to disk.
+
+        Args:
+            path: Directory path for saving.
+        """
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        index_file = path / "index.pt"
+        if self._index is not None:
+            self._index.save(index_file)
+        elif index_file.exists():
+            index_file.unlink()
+        torch.save(
+            {
+                "documents": [
+                    {"page_content": d.page_content, "metadata": d.metadata}
+                    for d in self._documents
+                ],
+                "ids": self._ids,
+                "tombstones": sorted(self._tombstones),
+                "bits": self._bits,
+                "metric": self._metric,
+                "seed": self._seed,
+                "dim": self._dim,
+            },
+            path / "metadata.pt",
+        )
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        embedding: Embeddings,
+        device: str | torch.device = "cpu",
+    ) -> TurboQuantVectorStore:
+        """Load a saved vector store.
+
+        Args:
+            path: Directory path to load from.
+            embedding: LangChain Embeddings model.
+            device: Torch device.
+
+        Returns:
+            Loaded TurboQuantVectorStore.
+
+        Note:
+            Metadata is loaded with ``weights_only=False`` because it contains
+            nested Python structures (documents, ids). Only load from trusted paths.
+        """
+        path = Path(path)
+        meta = torch.load(path / "metadata.pt", weights_only=False)
+
+        store = cls(
+            embedding=embedding,
+            dim=None,
+            bits=meta["bits"],
+            metric=meta["metric"],
+            seed=meta["seed"],
+            device=device,
+        )
+        store._dim = meta["dim"]
+
+        index_path = path / "index.pt"
+        if index_path.exists():
+            store._index = TurboQuantIndex.load(index_path, device=device)
+
+        store._documents = [
+            Document(page_content=d["page_content"], metadata=d["metadata"])
+            for d in meta["documents"]
+        ]
+        store._ids = list(meta["ids"])
+        store._id_to_pos = {doc_id: i for i, doc_id in enumerate(store._ids)}
+        store._tombstones = set(meta.get("tombstones", []))
+        return store
+
+
+################################################################################
+FILE: pyturboquant\search\__init__.py
+################################################################################
+
+"""pyturboquant.search -- Nearest-neighbor search with TurboQuant."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from pyturboquant.search.index import TurboQuantIndex
+
+if TYPE_CHECKING:
+    from pyturboquant.search.langchain import TurboQuantVectorStore
+
+__all__ = ["TurboQuantIndex", "TurboQuantVectorStore"]
+
+
+def __getattr__(name: str) -> Any:
+    # Lazy import so importing pyturboquant.search doesn't pull in langchain-core
+    # unless the optional integration is actually requested.
+    if name == "TurboQuantVectorStore":
+        from pyturboquant.search.langchain import TurboQuantVectorStore
+
+        return TurboQuantVectorStore
+    raise AttributeError(f"module 'pyturboquant.search' has no attribute {name!r}")
+
+
+################################################################################
+FILE: pyturboquant\scripts\demo_quantize.py
+################################################################################
+
+import torch
+from pyturboquant.core import MSEQuantizer
+
+def demo():
+    # 1. Setup: A 128-dimensional vector at 4-bit quantization
+    dim = 128
+    bits = 4
+    quantizer = MSEQuantizer(dim=dim, bits=bits, seed=42)
+
+    # 2. Create a random "embedding" vector
+    original_vector = torch.randn(dim)
+    print(f"--- Original Vector (First 5 components) ---")
+    print(original_vector[:5])
+
+    # 3. Quantize (The "Action")
+    # This performs: Scale -> Rotate -> Bin -> Pack
+    quantized_data = quantizer.quantize(original_vector)
+    
+    # Let's see the "Packed" data (The raw bytes)
+    # Since 4 bits/coord, 128 coords = 512 bits = 64 bytes
+    print(f"\n--- Compressed Representation ---")
+    print(f"Original size (fp32): {dim * 4} bytes")
+    print(f"Compressed size:      {len(quantized_data.packed_indices)} bytes + 4 bytes norm")
+    print(f"Compression Ratio:    { (dim*4) / (len(quantized_data.packed_indices) + 4):.2f}x")
+
+    # 4. Dequantize (The "Reconstruction")
+    reconstructed_vector = quantizer.dequantize(quantized_data)
+    print(f"\n--- Reconstructed Vector (First 5 components) ---")
+    print(reconstructed_vector[:5])
+
+    # 5. Measure the loss (MSE)
+    mse = torch.mean((original_vector - reconstructed_vector) ** 2)
+    print(f"\n--- Accuracy ---")
+    print(f"Mean Squared Error: {mse:.8f}")
+    
+    # Cosine Similarity (How close are they in direction?)
+    cos = torch.nn.functional.cosine_similarity(original_vector.unsqueeze(0), reconstructed_vector.unsqueeze(0))
+    print(f"Cosine Similarity:  {cos.item():.4f} (1.0 is perfect)")
+
+if __name__ == "__main__":
+    demo()
+
+
+################################################################################
+FILE: pyturboquant\scripts\precompute_codebooks.py
+################################################################################
+
+#!/usr/bin/env python3
+"""Precompute Lloyd-Max codebooks for standard Gaussian N(0,1) at bit-widths 1-8.
+
+Saves results as .pt files under src/pyturboquant/data/codebooks/. Requires scipy.
+
+Usage:
+    python scripts/precompute_codebooks.py
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+
+from pyturboquant.core.codebook import _compute_gaussian_codebook
+
+
+def main() -> None:
+    out_dir = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "pyturboquant"
+        / "data"
+        / "codebooks"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for bits in range(1, 9):
+        print(f"Computing codebook for b={bits} ({1 << bits} levels)...")
+        cb = _compute_gaussian_codebook(bits)
+        path = out_dir / f"gaussian_b{bits}.pt"
+        torch.save(
+            {
+                "centroids": cb.centroids,
+                "boundaries": cb.boundaries,
+                "mse_cost": cb.mse_cost,
+                "bits": cb.bits,
+            },
+            path,
+        )
+        print(f"  -> {path}  (MSE cost = {cb.mse_cost:.8f})")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+################################################################################
+FILE: pyturboquant\scripts\embbeding_model_demo.py
+################################################################################
+
+import torch
+import time
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+from pyturboquant.search import TurboQuantIndex
+
+def run_comparison_demo():
+    # 1. Setup
+    print("\n" + "="*60)
+    print(" TURBOQUANT vs. FULL PRECISION: SEMANTIC SEARCH BATTLE")
+    print("="*60)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Running on: {device.upper()}")
+    
+    # Cache the model locally to avoid re-downloading
+    models_dir = Path(__file__).resolve().parent.parent / "models"
+    models_dir.mkdir(exist_ok=True)
+    
+    print(f"Loading model (using cache at {models_dir})...")
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=device, cache_folder=str(models_dir))
+    dim = 384
+    bits = 4
+    
+    # 2. Data: Let's use a larger set to make the timing more interesting
+    sentences = [
+        "A man is eating a piece of bread.",
+        "The girl is carrying a baby.",
+        "A man is riding a horse.",
+        "A woman is playing violin.",
+        "Two men pushed carts through the woods.",
+        "A man is riding a white horse on an enclosed ground.",
+        "A group of people are dancing in the street.",
+        "A chef is preparing a delicious meal.",
+        "The astronaut is floating in space.",
+        "A programmer is writing code on a laptop.",
+    ]
+    
+    # 3. Encoding (Standard for both)
+    print("\n[1/4] Encoding sentences into vectors...")
+    embeddings = model.encode(sentences, convert_to_tensor=True)
+    
+    # --- THE OLD WAY (Full Precision) ---
+    print("\n[2/4] Setup: 'The Old Way' (Standard FP32 Index)")
+    t0 = time.perf_counter()
+    # In the old way, "indexing" is just keeping the tensor in memory
+    old_memory_bytes = embeddings.element_size() * embeddings.nelement()
+    t_old_index = (time.perf_counter() - t0) * 1000
+    
+    # --- THE NEW WAY (TurboQuant) ---
+    print("[3/4] Setup: 'The New Way' (TurboQuant 4-bit Index)")
+    t0 = time.perf_counter()
+    index = TurboQuantIndex(dim=dim, bits=bits, device=device)
+    index.add(embeddings)
+    t_new_index = (time.perf_counter() - t0) * 1000
+    new_memory_bytes = (index.memory_usage_mb * 1024 * 1024)
+    
+    # --- THE SEARCH BATTLE ---
+    query_text = "Someone is playing a musical instrument"
+    print(f"\n[4/4] BATTLE: Querying for '{query_text}'")
+    query_emb = model.encode([query_text], convert_to_tensor=True)
+    
+    # Old Search
+    t0 = time.perf_counter()
+    scores = torch.matmul(query_emb, embeddings.T)
+    old_best_idx = torch.argmax(scores).item()
+    t_old_search = (time.perf_counter() - t0) * 1000
+    
+    # New Search
+    t0 = time.perf_counter()
+    distances, indices = index.search(query_emb, k=1)
+    new_best_idx = indices[0][0].item()
+    t_new_search = (time.perf_counter() - t0) * 1000
+    
+    # --- RESULTS ---
+    print("\n" + "-"*60)
+    print(f"{'METRIC':<20} | {'OLD WAY (FP32)':<18} | {'NEW WAY (TQ)':<15}")
+    print("-"*60)
+    print(f"{'Memory Usage':<20} | {old_memory_bytes:>10,.0f} bytes  | {new_memory_bytes:>8,.0f} bytes")
+    print(f"{'Storage Savings':<20} | {'1.00x (Baseline)':<18} | {old_memory_bytes/new_memory_bytes:>8.2f}x SAVINGS")
+    print("-"*60)
+    print(f"{'Indexing Time':<20} | {t_old_index:>13.2f} ms | {t_new_index:>10.2f} ms")
+    print(f"{'Search Time':<20} | {t_old_search:>13.4f} ms | {t_new_search:>10.4f} ms")
+    print("-"*60)
+    print(f"{'Top Result':<20} | {sentences[old_best_idx][:25]}... | {sentences[new_best_idx][:25]}...")
+    print("-"*60)
+    
+    if old_best_idx == new_best_idx:
+        print("\nSUCCESS: Both systems found the same correct answer despite the 8x compression!")
+    else:
+        print("\nNOTE: Results differ slightly due to quantization loss.")
+
+if __name__ == "__main__":
+    run_comparison_demo()
+
+
+
+can you injest this as well. 
