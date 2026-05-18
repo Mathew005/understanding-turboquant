@@ -60,29 +60,32 @@ When engineering a quantized inference pipeline, we must draw a strict line betw
 
 ---
 
-## 5. On-the-Fly Compression & 1-Bit Error Correction (QJL)
+## 5. The Original QJL Error Correction Proposal
 
-Even with random rotation smoothing out the data, chopping FP16 down to 4 bits intrinsically causes tiny compounding rounding errors. If left uncorrected, these errors would slowly bias the model's logic over a long context window.
+Even with random rotation smoothing out the data, chopping FP16 down to 4 bits intrinsically causes tiny compounding rounding errors. The original paper hypothesized that if left uncorrected, these errors would slowly bias the model's logic over a long context window, requiring an active correction pass.
 
-To fix this without reinflating the memory footprint, TurboQuant utilizes **Quantized Johnson-Lindenstrauss (QJL)** for real-time 1-bit error correction.
+To address this, TurboQuant proposed utilizing **Quantized Johnson-Lindenstrauss (QJL)** for real-time 1-bit error correction.
 
-Right at the moment of compression, the kernel calculates the exact **Residual Error** between the pristine FP16 vector and the newly compressed low-bit vector. Instead of storing this massive error, QJL splits it into two lightweight components:
+In the original design, right at the moment of compression, the kernel calculates the exact **Residual Error** between the pristine FP16 vector and the newly compressed low-bit vector. Instead of storing this massive error, QJL splits it into two lightweight components:
 * **The 1-Bit Direction ($S$):** A bit-packed matrix simply noting whether the quantization missed too high ($+1$) or too low ($-1$).
 * **The Average Magnitude ($\alpha$):** A single FP16 scalar representing the average size of the error across a block of dimensions.
 
-By saving just these tiny mathematical breadcrumbs, the cache remains highly compressed but retains the ability to perfectly correct itself during the retrieval phase.
+It was theorized that by saving just these tiny mathematical breadcrumbs, the cache would remain highly compressed but retain the ability to perfectly correct itself during the retrieval phase.
 
 > 🔬 **Go deeper:** [QJL Error Correction — the full bit-level mechanics](theory_qjl.md)
 
+> [!NOTE]
+> **Engineering Update:** While QJL provides a mathematically perfect "unbiased estimator" for academic proofs, our real-world benchmarking with the Rust [turbovec](https://github.com/RyanCodrai/turbovec) implementation revealed that a **pure 4-bit MSE quantizer** (without the 1-bit QJL correction) actually achieves better recall, higher compression, and vastly faster search speeds by eliminating the bitwise math overhead.
+
 ---
 
-## 6. Hardware Execution: The Modified Attention Mechanism
+## 6. Hardware Execution: The Originally Proposed Attention Mechanism
 
 When generating the next word, the attention layer must take the dot product of a newly generated Query vector against the compressed historical Keys in the cache. 
 
-The custom CUDA kernel splits this into a primary calculation and a high-speed correction. First, it computes the dot product using the compressed Key vector to get a fast, base attention score. Simultaneously, it uses blisteringly fast bitwise addition/subtraction to calculate the correction term using our saved 1-bit direction ($S$) and scalar ($\alpha$).
+The originally proposed CUDA kernel split this into a primary calculation and a high-speed correction. First, it computed the dot product using the compressed Key vector to get a fast, base attention score. Simultaneously, it used blisteringly fast bitwise addition/subtraction to calculate the correction term using our saved 1-bit direction ($S$) and scalar ($\alpha$).
 
-**The Memory Bandwidth Paradox:** Doing this extra error-correction math actually makes the model faster. Modern GPUs are entirely bottlenecked by memory fetch times. By shrinking the data by 75%, we drastically reduce the time the GPU spends waiting for memory to arrive. The tiny fraction of a microsecond it takes to run the bitwise correction is entirely absorbed by the massive time saved on the memory fetch, resulting in a net acceleration.
+**The Memory Bandwidth Paradox:** The original theory stated that doing this extra error-correction math would actually make the model faster because the massive memory fetch savings would outweigh the bitwise compute overhead. However, as our engineering tests revealed, completely bypassing this correction step provides even greater acceleration by removing the bitwise computation entirely.
 
 ![TurboQuant Hardware Architecture](assets/2_Turbo_quant_architecture_in_attention_mechanism.png)
 
@@ -102,7 +105,7 @@ This architectural decoupling provides massive advantages for data engineering:
 
 To bridge the gap between theoretical math and actual implementation, we used [`pyturboquant`](https://github.com/jorgebmann/pyturboquant), an experimental Python vector index, and stress-tested it. From our experience analyzing this system, we observed what we'd call the "Naive vs. Optimized" engineering reality of vector compression.
 
-> 📊 The full results and charts from our benchmarking runs are documented in the [Benchmarking pyturboquant](benchmarks.md) companion piece.
+> 📊 The full results and charts from our benchmarking runs are documented in the [TurboQuant Benchmarks](benchmarks.md) companion piece.
 
 ### Phase 1: Solving the Memory Crisis (v0.1.0)
 In our initial tests, we focused purely on the memory bottleneck. We generated 100,000 vector embeddings (using `all-MiniLM-L6-v2` at 384 dimensions) and recorded the following results.
@@ -143,15 +146,18 @@ By combining extreme 4-bit memory compression with intelligent IVF clustering, s
 
 ---
 
-## 8. Conclusion: The Engineering Trade-offs of TurboQuant
+## 8. Conclusion: The Engineering Evolution of TurboQuant
 
 The era of memory-bound artificial intelligence requires strict engineering compromises. While adding more physical VRAM is not a scalable solution for infinite context windows or billion-scale vector retrieval, implementing extreme compression frameworks like TurboQuant introduces its own set of strict trade-offs.
 
-The core mechanic of TurboQuant—using random orthogonal rotation paired with 4-bit compression—successfully shifts the hardware bottleneck from memory bandwidth to compute. However, as our benchmarking revealed, this is not a silver bullet.
+The core mechanic of TurboQuant—using random orthogonal rotation paired with 4-bit compression—was originally thought to shift the hardware bottleneck from memory bandwidth to compute. However, as our benchmarking revealed, this is not a silver bullet.
 
-For Large Language Models, applying these techniques to the KV cache alongside QJL error correction allows models to operate with a fraction of the memory footprint. While this effectively mitigates Out-Of-Memory crashes for long-context prompts, the extra bitwise math required for on-the-fly decompression and error correction adds latency overhead that must be heavily optimized at the CUDA level to prevent generation slowdowns.
+For Large Language Models, applying these techniques to the KV cache (whether with QJL or pure MSE) allows models to operate with a fraction of the memory footprint. While this effectively mitigates Out-Of-Memory crashes for long-context prompts, the extra bitwise math required for on-the-fly decompression and error correction adds latency overhead that must be heavily optimized at the CUDA level to prevent generation slowdowns.
 
-For Vector Databases, the reality is even starker. While TurboQuant easily achieves a ~7.7x reduction in storage (allowing 100 million vectors to fit into consumer RAM), it completely destroys brute-force search latency. Because compressed data loses its geometric meaning, naive retrieval becomes entirely compute-bound—running over 100x slower in our FP32 vs. 4-bit CPU benchmarks. Furthermore, extreme compression intrinsically causes data loss, lowering exact-match retrieval accuracy (dropping to 80% in our mid-scale testing).
+> [!NOTE]
+> **Engineering Update:** As demonstrated by the native Rust [turbovec](https://github.com/RyanCodrai/turbovec) implementation, dropping the QJL error correction entirely in favor of a pure 4-bit Lloyd-Max quantizer eliminates this bitwise latency overhead. This architectural pivot resulted in a **2.58x search speedup** over FP32 NumPy while simultaneously improving recall and memory savings.
+
+For Vector Databases, the reality is even starker. While TurboQuant easily achieves a ~7.7x reduction in storage (allowing 100 million vectors to fit into consumer RAM), naive CPU implementations can suffer a severe search latency penalty. Because compressed data loses its geometric meaning, naive CPU retrieval becomes entirely compute-bound—running over 100x slower in our FP32 vs. 4-bit CPU benchmarks. However, compiled SIMD engines (like [turbovec](https://github.com/RyanCodrai/turbovec)) easily overcome this compute-bound limitation. Furthermore, extreme compression intrinsically causes data loss, lowering exact-match retrieval accuracy (dropping to 80% in our mid-scale testing).
 
 Ultimately, TurboQuant is a specialized optimization for extreme-scale memory problems, not a universal upgrade. It forces engineers to sacrifice compute cycles and a marginal degree of accuracy in exchange for the ability to run massive context windows and databases on constrained local hardware.
 
