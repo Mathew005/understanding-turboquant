@@ -4,7 +4,7 @@
 
 Even with random rotation smoothing out outliers, compressing a 16-bit floating point number to just 3 or 4 bits intrinsically causes some loss of precision. Over thousands of tokens, these tiny rounding errors can compound and bias the attention mechanism. 
 
-To fix this, TurboQuant employs a real-time, ultra-lightweight error correction scheme based on the **Johnson-Lindenstrauss** lemma.
+To fix this, the original TurboQuant paper proposed a real-time, ultra-lightweight error correction scheme based on the **Johnson-Lindenstrauss** lemma.
 
 ## The Residual Error
 
@@ -34,16 +34,38 @@ This $\alpha$ is stored in full FP16 precision. Because there is only one $\alph
 We have now successfully approximated the massive FP16 error tensor as:
 $$E \approx \alpha S$$
 
-## Hardware-Accelerated Correction
+## The Proposed Hardware-Accelerated Correction
 
 During the attention calculation, the Query vector ($Q$) must take the dot product against the corrected Key vector ($K \approx \hat{K} + \alpha S$).
 
 By distributing the dot product, we get:
 $$Q \cdot K \approx (Q \cdot \hat{K}) + \alpha(Q \cdot S)$$
 
-The genius of this approach lies in how hardware executes $\alpha(Q \cdot S)$.
+The theoretical elegance of this approach lies in how hardware executes $\alpha(Q \cdot S)$.
 Because $S$ only contains $+1$ and $-1$, computing $Q \cdot S$ **requires no multiplication**. The CUDA kernel simply iterates over the Query dimensions and performs bitwise addition or subtraction based on the packed bits in $S$. 
 
-This bitwise logic executes at blistering speed on modern GPUs. We get the accuracy recovery of an FP16 error-correction pass, executed using the latency profile of an integer addition.
+This bitwise logic was theorized to execute at blistering speed on modern GPUs, supposedly offering the accuracy recovery of an FP16 error-correction pass using the latency profile of an integer addition. However, as shown below, omitting it entirely provides even greater acceleration.
 
 ![TurboQuant Hardware Architecture](assets/2_Turbo_quant_architecture_in_attention_mechanism.png)
+
+---
+
+## Engineering Update: The "Unbiased Estimator" vs. Pure MSE
+
+While the Quantized Johnson-Lindenstrauss (QJL) correction described above is mathematically elegant, real-world implementations have revealed it to be largely unnecessary—and sometimes even detrimental—to actual engine performance.
+
+### The Academic Trap
+The original TurboQuant architecture included the 1-bit QJL transform to provide what mathematicians call an **"unbiased estimator."** In pure mathematics, an unbiased estimator ensures that if you run a calculation a billion times, the *average* error is exactly zero. This property is crucial for writing mathematical proofs about the algorithm's theoretical limits.
+
+### The Real-World Engineering Solution
+In a production system, we care about the **variance** of the error (how close our individual guesses are to the truth), not just the long-term mathematical average. 
+
+The `pyturboquant` engine faithfully mirrored the paper by splitting its 4-bit budget: **3 bits for MSE** (8 bins) + **1 bit for QJL correction**. 
+However, when we built the native Rust [turbovec](https://github.com/RyanCodrai/turbovec) implementation, we dropped the QJL correction entirely and allocated the full 4-bit budget to the **Pure MSE** quantizer (16 bins).
+
+Because the 16 bins are much narrower than 8 bins, the Pure 4-bit MSE quantizer tightly bounds the Gaussian data, resulting in a naturally lower variance. The "baseline guess" becomes so precise that it out-performs the 3-bit guess even *after* the 1-bit QJL correction is applied.
+
+**The result of dropping QJL:**
+* **Better Recall:** The exactness of 16 Lloyd-Max bins yielded a 97.7% Recall@10, outperforming the 97.5% of the Split-Budget method.
+* **Higher Compression:** By omitting the 1-bit sign matrix $S$ (which required 16 bytes per vector), the overall compression ratio improved from 7.7x to 7.8x.
+* **Massive Speedup:** Bypassing the bitwise hardware-accelerated correction logic allowed the Rust SIMD vectors to execute pure dot products natively, resulting in a 2.58x speedup over standard FP32 NumPy in our [turbovec](https://github.com/RyanCodrai/turbovec) tests.

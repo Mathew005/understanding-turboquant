@@ -7,7 +7,7 @@ const PAGES = {
   'theory_outliers.md':    'Deep Dive: Activation Outliers',
   'theory_incoherence.md': 'Deep Dive: Random Rotation',
   'theory_qjl.md':         'Deep Dive: QJL Correction',
-  'benchmarks.md':         'Benchmarking pyturboquant',
+  'benchmarks.md':         'Benchmarking TurboQuant',
 };
 
 // Display order in the sidebar "In This Series" section

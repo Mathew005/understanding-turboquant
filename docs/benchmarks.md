@@ -1,8 +1,8 @@
-# Benchmarking [pyturboquant](https://github.com/jorgebmann/pyturboquant)
+# Benchmarking TurboQuant: Python vs. Rust
 
 *A companion piece to [Understanding TurboQuant](article.md)*
 
-To ground the theory in practice, we used [`pyturboquant`](https://github.com/jorgebmann/pyturboquant) — an experimental Python vector index that implements TurboQuant's core algorithm: random orthogonal rotation followed by Lloyd-Max 4-bit quantization. This document records the full results of our benchmarking sessions across four progressively demanding experiments.
+To ground the theory in practice, we initially used [`pyturboquant`](https://github.com/jorgebmann/pyturboquant) — an experimental Python vector index that implements TurboQuant's core algorithm: random orthogonal rotation followed by Lloyd-Max 4-bit quantization. This document records the full results of our benchmarking sessions across four progressively demanding experiments.
 
 **Embedding model:** `all-MiniLM-L6-v2` (384 dimensions)
 **Quantization:** 4-bit, TurboQuant Algorithm 1 & 2
@@ -167,7 +167,7 @@ We encoded the 2,000 Sherlock Holmes paragraphs, then tiled and perturbed them w
 | Search time | **3.82 ms** | 414.58 ms |
 
 > [!NOTE]
-> On CPU at 100K vectors, brute-force matrix multiplication is ~108x faster. TurboQuant's decompression overhead — unpack → centroid lookup → inverse rotation — dominates at this scale. The value here is entirely in the memory saving.
+> In Python on CPU at 100K vectors, brute-force matrix multiplication is ~108x faster. The Python implementation's decompression overhead — unpack → centroid lookup → inverse rotation — dominates at this scale. The value here is entirely in the memory saving.
 
 ### 4b. GPU Multi-Scale Results (RTX 5060, 8 GB VRAM)
 
@@ -195,7 +195,7 @@ We encoded the 2,000 Sherlock Holmes paragraphs, then tiled and perturbed them w
 > **Recall is remarkably stable across all scales.** Recall@1 remains ~90% and Recall@10 stays ~98% whether the database has 100K or 1M vectors. The quantization accuracy is a fixed property of the algorithm's codebook, not the database size.
 
 > [!NOTE]
-> **The speed gap narrows dramatically with scale.** At 100K vectors, brute-force is 39x faster. At 300K+, the gap collapses to ~5x because FP32 `matmul` becomes **memory-bandwidth bound** — the GPU is now streaming 1.4 GB of data per query vs. TurboQuant's 190 MB.
+> **In Python, the speed gap narrows dramatically with scale.** At 100K vectors, brute-force is 39x faster. At 300K+, the gap collapses to ~5x because FP32 `matmul` becomes **memory-bandwidth bound** — the GPU is now streaming 1.4 GB of data per query vs. TurboQuant's 190 MB.
 
 ### 4c. Scaling Trend: Search Time vs. Vector Count (GPU)
 
@@ -237,14 +237,36 @@ Across all experiments — from 10 sentences to 1,000,000 vectors, on both CPU a
 
 ### Key Takeaways
 
-1. **TurboQuant is primarily a memory optimization** at its current stage. Its practical value is enabling vector search at scales where full-precision storage would exceed available RAM or VRAM.
+1. **In naive Python implementations, TurboQuant is primarily a memory optimization** at its current stage. Its practical value is enabling vector search at scales where full-precision storage would exceed available RAM or VRAM. However, optimized native implementations completely change this paradigm, making it a speed optimization as well.
 
 2. **Accuracy is excellent and scale-independent.** Recall@1 stays at ~90% and Recall@10 at ~98% from 100K to 1M vectors. The quantization error is a fixed property of the Lloyd-Max codebook, not the database size.
 
 3. **Semantic meaning survives extreme compression.** A query for "musical instrument" correctly found "violin" even after discarding 87% of the data. Random rotation makes the coordinate distribution Gaussian, and Lloyd-Max codebooks are specifically optimised to preserve that structure.
 
-4. **The speed gap narrows as scale increases.** On GPU, the FP32 advantage drops from ~39x at 100K to ~5x at 300K+. Brute-force `matmul` becomes memory-bandwidth bound at scale — TurboQuant's smaller data footprint partially offsets its decompression cost.
+4. **The speed gap in Python narrows as scale increases.** On GPU, the FP32 advantage drops from ~39x at 100K to ~5x at 300K+. Brute-force `matmul` becomes memory-bandwidth bound at scale — TurboQuant's smaller data footprint partially offsets its decompression cost. Under compiled native architectures, this memory bandwidth savings translates directly into search speedups that beat raw FP32.
 
 5. **At 10M+ vectors, TurboQuant becomes the only viable option.** FP32 storage requires ~14.6 GB — exceeding most GPU VRAM budgets — while TurboQuant needs only ~1.9 GB.
 
-6. **The remaining speed gap is an architectural problem, not an algorithmic one.** An Inverted File Index (IVF) partition layer would eliminate the brute-force O(n) scan, reducing each query to decompressing ~1% of the database. This is the natural next step for [`pyturboquant`](https://github.com/jorgebmann/pyturboquant).
+6. **The speed gap observed in Python is an implementation bottleneck, not an algorithmic one.** An Inverted File Index (IVF) partition layer would eliminate the brute-force O(n) scan in PyTurboQuant, reducing each query to decompressing ~1% of the database. Alternatively, compiling the index in a high-performance language with SIMD (like Rust) eliminates this bottleneck entirely even in brute-force scenarios.
+
+---
+
+## Engineering Update: Rust Implementation (`turbovec`)
+
+Following the initial Python benchmarks, the engine was rewritten natively in Rust as [turbovec](https://github.com/RyanCodrai/turbovec). The Rust implementation abandoned the split-budget QJL error correction described in the original paper, opting instead for a **Pure 4-bit MSE** quantizer. 
+
+This architectural change, combined with native SIMD instructions, drastically altered the performance profile compared to the Python `pyturboquant` baseline.
+
+### Multi-Scale GPU Stress Test (Rust SIMD)
+
+| Scale (Vectors) | Old Mem (FP32) | TQ Mem (4-bit) | Memory Savings | Old Search (NumPy) | TQ Search (Rust SIMD) | Speedup | Recall@1 | Recall@10 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **100,000** | 146.5 MB | 18.7 MB | **7.8x** | 20.00 ms | 8.76 ms | **2.28x** | 92.0% | 97.7% |
+| **300,000** | 439.5 MB | 56.1 MB | **7.8x** | 65.18 ms | 16.09 ms | **4.05x** | 92.0% | 99.0% |
+| **500,000** | 732.4 MB | 93.5 MB | **7.8x** | 92.84 ms | 28.72 ms | **3.23x** | 92.0% | 97.0% |
+| **1,000,000** | 1464.8 MB | 186.9 MB | **7.8x** | 176.80 ms | 68.58 ms | **2.58x** | 92.0% | 99.3% |
+
+### Key Improvements over Python
+1. **The Latency Revolution:** By bypassing the QJL bitwise logic and executing pure SIMD dot products, `turbovec` is **2.58x faster** than raw FP32 NumPy at 1 million vectors (68.58 ms vs 176.80 ms). The CPU/GPU search bottleneck has been solved.
+2. **Better Compression:** Dropping the 1-bit QJL sign matrix saves 16 bytes per vector, pushing the compression ratio from 7.7x to **7.8x**.
+3. **Better Accuracy:** Dedicating the full 4-bit budget to 16 Lloyd-Max bins (instead of 8 bins + 1 correction bit) naturally bounded the variance tighter, resulting in a slightly higher Recall@10 (97.7% vs 97.5% at 100K).
